@@ -29,6 +29,7 @@ await build({
     join(src, 'content/media-session.ts'),
     join(src, 'content/bandcamp.ts'),
     join(src, 'content/beatport.ts'),
+    join(src, 'content/page-badges.ts'),
     join(src, 'popup/popup.ts'),
     join(src, 'options/options.ts'),
   ],
@@ -40,7 +41,7 @@ await build({
 });
 
 // Static HTML/CSS.
-for (const f of ['popup/popup.html', 'popup/popup.css', 'options/options.html', 'options/options.css']) {
+for (const f of ['popup/popup.html', 'popup/popup.css', 'options/options.html', 'options/options.css', 'content/page-badges.css']) {
   const dest = join(outdir, f);
   await mkdir(dirname(dest), { recursive: true });
   await cp(join(src, f), dest);

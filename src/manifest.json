@@ -46,6 +46,19 @@
         "*://*.beatport.com/*"
       ],
       "run_at": "document_idle"
+    },
+    {
+      "js": [
+        "content/page-badges.js"
+      ],
+      "matches": [
+        "*://open.spotify.com/*",
+        "*://*.bandcamp.com/*",
+        "*://*.soundcloud.com/*",
+        "*://*.deezer.com/*",
+        "*://*.tidal.com/*"
+      ],
+      "run_at": "document_idle"
     }
   ],
   "description": "Send what's playing, selected text, or release pages straight to your SoulSync server.",
@@ -71,6 +84,20 @@
     "https://*/*"
   ],
   "options_page": "options/options.html",
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "content/page-badges.css"
+      ],
+      "matches": [
+        "*://open.spotify.com/*",
+        "*://*.bandcamp.com/*",
+        "*://*.soundcloud.com/*",
+        "*://*.deezer.com/*",
+        "*://*.tidal.com/*"
+      ]
+    }
+  ],
   "permissions": [
     "storage",
     "contextMenus",

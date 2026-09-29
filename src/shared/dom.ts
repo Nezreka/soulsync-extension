@@ -13,7 +13,14 @@ export function jsonLdOfType(pattern: RegExp): Record<string, unknown> | null {
   for (const el of document.querySelectorAll('script[type="application/ld+json"]')) {
     try {
       const json: unknown = JSON.parse(el.textContent || '');
-      const items = Array.isArray(json) ? json : [json];
+      const top = Array.isArray(json) ? json : [json];
+      // Unwrap @graph containers (schema.org convention) before matching.
+      const items = top.flatMap((j) => {
+        if (j && typeof j === 'object' && Array.isArray((j as Record<string, unknown>)['@graph'])) {
+          return (j as Record<string, unknown>)['@graph'] as unknown[];
+        }
+        return [j];
+      });
       const hit = items.find(
         (j): j is Record<string, unknown> =>
           !!j && typeof j === 'object' && typeof (j as Record<string, unknown>)['@type'] === 'string' &&
