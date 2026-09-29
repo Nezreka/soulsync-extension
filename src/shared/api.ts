@@ -73,10 +73,12 @@ export async function saveConfig(cfg: ServerConfig): Promise<void> {
  */
 export async function testConnection(cfg: ServerConfig): Promise<string> {
   const origin = new URL(cfg.url).origin + '/*';
-  if (!(await browser.permissions.contains({ origins: [origin] }))) {
-    const granted = await browser.permissions.request({ origins: [origin] });
-    if (!granted) throw new Error('Permission to reach your server was not granted.');
-  }
+  // Call request() with no await in front of it: it must run synchronously
+  // inside the click's task or Firefox rejects it with "may only be called
+  // from a user input handler". request() resolves true without prompting
+  // when the origin is already granted, so no contains() check is needed.
+  const granted = await browser.permissions.request({ origins: [origin] });
+  if (!granted) throw new Error('Permission to reach your server was not granted.');
   await apiFetch(cfg, `${V1}/playlists`, { method: 'GET' });
   return 'Connected — the server answered with your API key.';
 }
