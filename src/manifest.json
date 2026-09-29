@@ -1,1 +1,84 @@
-{"action":{"default_icon":{"128":"icons/icon-128.png","16":"icons/icon-16.png","48":"icons/icon-48.png"},"default_popup":"popup/popup.html","default_title":"SoulSync Companion"},"background":{"service_worker":"background/service-worker.js","type":"module"},"content_scripts":[{"js":["content/media-session.js"],"matches":["*://*.youtube.com/*","*://music.youtube.com/*","*://open.spotify.com/*","*://*.soundcloud.com/*","*://*.deezer.com/*","*://*.tidal.com/*","*://*.bandcamp.com/*","*://*.beatport.com/*"],"run_at":"document_idle"},{"js":["content/bandcamp.js"],"matches":["*://*.bandcamp.com/*"],"run_at":"document_idle"},{"js":["content/beatport.js"],"matches":["*://*.beatport.com/*"],"run_at":"document_idle"}],"description":"Send what's playing, selected text, or release pages straight to your SoulSync server.","icons":{"128":"icons/icon-128.png","16":"icons/icon-16.png","48":"icons/icon-48.png"},"manifest_version":3,"name":"SoulSync Companion","browser_specific_settings":{"gecko":{"id":"soulsync-companion@nezreka.dev"}},"optional_host_permissions":["http://*/*","https://*/*"],"options_page":"options/options.html","permissions":["storage","contextMenus","activeTab","scripting"],"version":"0.1.0"}
+{
+  "action": {
+    "default_icon": {
+      "128": "icons/icon-128.png",
+      "16": "icons/icon-16.png",
+      "48": "icons/icon-48.png"
+    },
+    "default_popup": "popup/popup.html",
+    "default_title": "SoulSync Companion"
+  },
+  "background": {
+    "scripts": [
+      "background/service-worker.js"
+    ],
+    "service_worker": "background/service-worker.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "js": [
+        "content/media-session.js"
+      ],
+      "matches": [
+        "*://*.youtube.com/*",
+        "*://music.youtube.com/*",
+        "*://open.spotify.com/*",
+        "*://*.soundcloud.com/*",
+        "*://*.deezer.com/*",
+        "*://*.tidal.com/*",
+        "*://*.bandcamp.com/*",
+        "*://*.beatport.com/*"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "js": [
+        "content/bandcamp.js"
+      ],
+      "matches": [
+        "*://*.bandcamp.com/*"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "js": [
+        "content/beatport.js"
+      ],
+      "matches": [
+        "*://*.beatport.com/*"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "description": "Send what's playing, selected text, or release pages straight to your SoulSync server.",
+  "icons": {
+    "128": "icons/icon-128.png",
+    "16": "icons/icon-16.png",
+    "48": "icons/icon-48.png"
+  },
+  "manifest_version": 3,
+  "name": "SoulSync Companion",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "soulsync-companion@nezreka.dev",
+      "data_collection_permissions": {
+        "required": [
+          "none"
+        ]
+      }
+    }
+  },
+  "optional_host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "options_page": "options/options.html",
+  "permissions": [
+    "storage",
+    "contextMenus",
+    "activeTab",
+    "scripting"
+  ],
+  "version": "0.1.0"
+}
