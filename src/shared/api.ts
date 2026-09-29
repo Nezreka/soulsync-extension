@@ -344,6 +344,227 @@ export async function importToPlaylist(
   });
 }
 
+/* ── page badges ── */
+
+export interface BadgeCandidate {
+  kind: 'artist' | 'album';
+  name: string;
+  /** album artist, when known — tightens the library match */
+  artist?: string;
+}
+
+/**
+ * Normalize for name comparison: diacritics stripped, case/punctuation
+ * folded. Unicode-aware (\\p{L}\\p{N}) so CJK/Korean names don't all
+ * collapse to "" and false-match each other.
+ */
+export function normName(s: string): string {
+  return (s || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim()
+    .replace(/\s+/g, ' ');
+}
+
+/**
+ * Session cache: badgeKey -> in-library (true/false). Nulls (unverifiable)
+ * are never cached — a transient failure may succeed on the next scan.
+ */
+const badgeCache = new Map<string, boolean>();
+
+function badgeKey(kind: string, name: string, artist?: string): string {
+  return `${kind}:${normName(artist ? `${artist} ${name}` : name)}`;
+}
+
+/**
+ * Tri-state library checks. `true` = verified in library, `false` = verified
+ * absent, `null` = couldn't verify (server error, or an album with no artist
+ * to disambiguate it). Callers must surface null as "unknown", never as
+ * "not in library".
+ */
+async function libraryHasArtist(cfg: ServerConfig, name: string): Promise<boolean | null> {
+  const key = badgeKey('artist', name);
+  const cached = badgeCache.get(key);
+  if (cached !== undefined) return cached;
+  const want = normName(name);
+  if (want.length === 0) return null;
+  try {
+    const data = await apiFetch(cfg, `${V1}/library/artists?search=${encodeURIComponent(name)}&limit=5`, {
+      method: 'GET',
+    });
+    const artists = data.artists;
+    const found =
+      Array.isArray(artists) &&
+      artists.some((a: unknown) => {
+        const n = (a as { name?: unknown }).name;
+        return typeof n === 'string' && normName(n) === want;
+      });
+    badgeCache.set(key, found);
+    return found;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve a library artist id for an exact normalized name match.
+ * Returns the id, `false` when the artist is absent, `null` on server error.
+ */
+async function libraryArtistId(cfg: ServerConfig, name: string): Promise<number | false | null> {
+  const want = normName(name);
+  if (want.length === 0) return null;
+  try {
+    const data = await apiFetch(cfg, `${V1}/library/artists?search=${encodeURIComponent(name)}&limit=5`, {
+      method: 'GET',
+    });
+    const artists = data.artists;
+    if (!Array.isArray(artists)) return null;
+    const hit = artists.find((a: unknown) => {
+      const n = (a as { name?: unknown }).name;
+      return typeof n === 'string' && normName(n) === want;
+    }) as { id?: unknown } | undefined;
+    const id = hit ? Number(hit.id) : NaN;
+    return Number.isFinite(id) ? id : false;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Strict album match, associated through the artist — never title-only.
+ * The artist name resolves to a library artist id, then the title must match
+ * exactly among THAT artist's albums. A title match under a different artist
+ * (ten bands have a "Greatest Hits") is correctly reported absent.
+ */
+async function libraryHasAlbum(
+  cfg: ServerConfig,
+  title: string,
+  artist?: string,
+): Promise<boolean | null> {
+  const key = badgeKey('album', title, artist);
+  const cached = badgeCache.get(key);
+  if (cached !== undefined) return cached;
+  const wantTitle = normName(title);
+  if (wantTitle.length === 0 || normName(artist ?? '').length === 0) return null;
+  try {
+    const artistId = await libraryArtistId(cfg, artist as string);
+    if (artistId === null) return null; // server error — unknown, not absent
+    if (artistId === false) {
+      // Artist isn't in the library, so their album can't be either.
+      badgeCache.set(key, false);
+      return false;
+    }
+    const data = await apiFetch(
+      cfg,
+      `${V1}/library/albums?search=${encodeURIComponent(title)}&artist_id=${artistId}&limit=10`,
+      { method: 'GET' },
+    );
+    const albums = data.albums;
+    const found =
+      Array.isArray(albums) &&
+      albums.some((a: unknown) => {
+        const t = (a as { title?: unknown }).title;
+        return typeof t === 'string' && normName(t) === wantTitle;
+      });
+    badgeCache.set(key, found);
+    return found;
+  } catch {
+    return null;
+  }
+}
+
+/** Batch library check for badge candidates. Tri-state per item: true =
+ *  in library, false = verified absent, null = couldn't verify. Never
+ *  throws — item errors surface as null, never as a false "not in library". */
+export async function lookupBadgeStatuses(
+  cfg: ServerConfig,
+  items: BadgeCandidate[],
+): Promise<Record<string, boolean | null>> {
+  const out: Record<string, boolean | null> = {};
+  await Promise.all(
+    items.map(async (it) => {
+      const key = badgeKey(it.kind, it.name, it.artist);
+      out[key] =
+        it.kind === 'artist'
+          ? await libraryHasArtist(cfg, it.name)
+          : await libraryHasAlbum(cfg, it.name, it.artist);
+    }),
+  );
+  return out;
+}
+
+export interface ArtistHit {
+  id: string;
+  name: string;
+  image: string;
+  /** Provider the hit came from ("spotify", "deezer", …) — the search
+   *  response names it; watchlist/add needs it for numeric ids. */
+  source: string;
+}
+
+/** POST /api/v1/search/artists — resolve a page artist name to a provider id. */
+export async function searchArtists(cfg: ServerConfig, query: string, limit = 5): Promise<ArtistHit[]> {
+  const data = await apiFetch(cfg, `${V1}/search/artists`, {
+    method: 'POST',
+    body: JSON.stringify({ query, source: 'auto', limit }),
+  });
+  const artists = data.artists;
+  const source = typeof data.source === 'string' ? data.source : '';
+  if (!Array.isArray(artists)) return [];
+  return artists
+    .map((a: unknown) => {
+      const o = a as Record<string, unknown>;
+      return {
+        id: o.id === undefined || o.id === null ? '' : String(o.id),
+        name: typeof o.name === 'string' ? o.name : '',
+        image: typeof o.image_url === 'string' ? o.image_url : '',
+        source,
+      };
+    })
+    .filter((h) => h.id.length > 0 && h.name.length > 0);
+}
+
+/** Best artist hit for a page name: exact normalized match, else top hit. */
+export function pickBestArtist(hits: ArtistHit[], wantName: string): ArtistHit | null {
+  if (hits.length === 0) return null;
+  const w = normName(wantName);
+  return hits.find((h) => normName(h.name) === w) ?? hits[0];
+}
+
+/**
+ * POST /api/watchlist/add — non-v1 route, so the key rides as ?api_key=
+ * (honored since server PR #1380). The provider `source` is sent when known:
+ * numeric Deezer/iTunes ids are ambiguous without it and the server refuses
+ * to guess. Throws with the server's message on error.
+ */
+export async function watchArtist(
+  cfg: ServerConfig,
+  artistId: string,
+  artistName: string,
+  source?: string,
+): Promise<void> {
+  const base = cfg.url.replace(/\/+$/, '');
+  const url = `${base}/api/watchlist/add?api_key=${encodeURIComponent(cfg.apiKey)}`;
+  const body: Record<string, string> = { artist_id: artistId, artist_name: artistName };
+  if (source) body.source = source;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = (await res.json().catch(() => ({}))) as { success?: boolean; error?: unknown };
+  if (!res.ok || data.success === false) {
+    throw new Error(typeof data.error === 'string' && data.error ? data.error : `Server returned ${res.status}`);
+  }
+}
+
+/** Server origin for the popover's "Open in SoulSync" link. */
+export function serverOrigin(cfg: ServerConfig): string {
+  return cfg.url.replace(/\/+$/, '');
+}
+
 /* ── server dashboard extras ── */
 
 export interface ServerStats {

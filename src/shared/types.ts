@@ -21,7 +21,7 @@ export interface ParsedTrack {
   ok: boolean;
 }
 
-export type ReleaseSource = 'bandcamp' | 'beatport';
+export type ReleaseSource = 'bandcamp' | 'beatport' | 'spotify' | 'soundcloud' | 'deezer' | 'tidal';
 
 export interface ReleaseInfo {
   source: ReleaseSource;

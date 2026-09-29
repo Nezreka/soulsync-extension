@@ -1,0 +1,186 @@
+/* SoulSync page badges — loaded via <link> inside each badge's shadow
+   root, so page CSS can't restyle it and page CSP can't block it
+   (external stylesheet, not inline <style>). */
+
+/* :host — not .ssb-host: this stylesheet lives INSIDE the shadow root,
+   where a class selector can't reach the host element itself. */
+:host {
+  display: inline-flex;
+  position: relative;
+  margin-left: 6px;
+  vertical-align: middle;
+  line-height: 1;
+}
+
+.ssb-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  background: none;
+  margin: 0;
+  cursor: default;
+  white-space: nowrap;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.ssb-loading {
+  background: rgba(128, 128, 128, 0.12);
+}
+
+.ssb-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #8b949e;
+  animation: ssb-pulse 1s ease-in-out infinite;
+}
+
+@keyframes ssb-pulse {
+  50% { opacity: 0.25; }
+}
+
+/* In your library — quiet green, readable on light and dark pages. */
+.ssb-in {
+  background: rgba(46, 160, 67, 0.14);
+  color: #3fb950;
+  border-color: rgba(46, 160, 67, 0.45);
+}
+
+/* Not in library — a faint dashed + that firms up on hover. */
+.ssb-out {
+  background: rgba(128, 128, 128, 0.1);
+  color: #8b949e;
+  border: 1px dashed rgba(139, 148, 158, 0.55);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 1px 7px;
+}
+
+.ssb-out:hover {
+  color: #e6edf3;
+  border-color: #8b949e;
+  background: rgba(128, 128, 128, 0.22);
+}
+
+/* You acted on it (watched / wishlisted) — quiet indigo. */
+.ssb-acted {
+  background: rgba(99, 102, 241, 0.14);
+  color: #8b9bff;
+  border-color: rgba(99, 102, 241, 0.45);
+}
+
+/* Couldn't verify (server error, or nothing to disambiguate with) —
+   grey ?, never a false "not in library". */
+.ssb-unknown {
+  background: rgba(128, 128, 128, 0.1);
+  color: #6e7681;
+  border: 1px dotted rgba(139, 148, 158, 0.4);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 1px 7px;
+}
+
+.ssb-unknown:hover {
+  color: #e6edf3;
+  border-color: #8b949e;
+}
+
+/* Popover — always the extension's dark card, positioned via JS
+   (position:fixed escapes overflow:hidden ancestors on the page). */
+.ssb-pop {
+  position: fixed;
+  z-index: 2147483647;
+  width: 232px;
+  box-sizing: border-box;
+  background: #16181d;
+  border: 1px solid #2a2e37;
+  border-radius: 10px;
+  padding: 10px 10px 8px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.55);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 13px;
+  line-height: 1.4;
+  color: #e6edf3;
+  text-align: left;
+}
+
+.ssb-pop-name {
+  font-weight: 700;
+  font-size: 13px;
+  margin-bottom: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ssb-pop-sub {
+  font-size: 12px;
+  color: #8b949e;
+  margin-bottom: 8px;
+}
+
+.ssb-btn {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin: 0 0 6px;
+  padding: 7px 10px;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.2;
+  color: #e6edf3;
+  background: #21252d;
+  border: 1px solid #2a2e37;
+  border-radius: 8px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.ssb-btn:hover:not([disabled]) {
+  background: #2a2f3a;
+  border-color: #3a4150;
+}
+
+.ssb-btn[disabled] {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.ssb-btn.ssb-primary {
+  background: #1f6feb;
+  border-color: #1f6feb;
+  color: #fff;
+}
+
+.ssb-btn.ssb-primary:hover:not([disabled]) {
+  background: #388bfd;
+  border-color: #388bfd;
+}
+
+.ssb-link {
+  display: block;
+  margin-top: 2px;
+  font-size: 12px;
+  color: #8b949e;
+  text-decoration: none;
+}
+
+.ssb-link:hover {
+  color: #e6edf3;
+  text-decoration: underline;
+}
+
+.ssb-err {
+  font-size: 12px;
+  color: #f85149;
+  margin: 0 0 6px;
+}
