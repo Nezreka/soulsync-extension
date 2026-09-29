@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const pkg = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
-const zipPath = join(root, `soulsync-companion-${pkg.version}.zip`);
+const zipPath = join(root, `${pkg.name}-${pkg.version}.zip`);
 
 const out = createWriteStream(zipPath);
 const archive = new ZipArchive({ zlib: { level: 9 } });

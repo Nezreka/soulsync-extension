@@ -10,7 +10,7 @@ the scope.
 npm install
 npm run build     # -> dist/
 npm run typecheck # tsc --noEmit
-npm run package   # -> soulsync-companion-<version>.zip (zips dist/)
+npm run package   # -> soulsync-extension-<version>.zip (zips dist/)
 ```
 
 Load unpacked:

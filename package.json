@@ -8,7 +8,7 @@
     "typescript": "^5.6.3",
     "webextension-polyfill": "^0.12.0"
   },
-  "name": "soulsync-companion",
+  "name": "soulsync-extension",
   "private": true,
   "scripts": {
     "build": "node scripts/build.mjs",

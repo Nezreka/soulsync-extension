@@ -55,4 +55,4 @@ const manifest = JSON.parse(await readFile(join(src, 'manifest.json'), 'utf8'));
 manifest.version = pkg.version;
 await writeFile(join(outdir, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
 
-console.log(`built soulsync-companion v${pkg.version} -> dist/`);
+console.log(`built ${pkg.name} v${pkg.version} -> dist/`);
