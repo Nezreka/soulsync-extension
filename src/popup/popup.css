@@ -313,6 +313,8 @@ button.slim { padding-top: 9px; padding-bottom: 9px; font-size: 13.5px; }
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 #dl-pill::before {
   content: "";
