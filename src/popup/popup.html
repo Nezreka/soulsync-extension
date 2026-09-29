@@ -1,0 +1,143 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <img id="logo" src="../icons/logo.png" alt="SoulSync" />
+      <span class="brand-name">SoulSync</span>
+      <span class="brand-sub">COMPANION</span>
+    </div>
+    <span id="conn-dot" class="dot" title="Server connection"></span>
+    <span id="dl-pill" class="dl-pill" hidden></span>
+    <a href="#" id="open-server" class="icon-btn" title="Open SoulSync">&#8599;</a>
+    <a href="#" id="open-options" class="icon-btn" title="Settings">&#9881;</a>
+  </header>
+
+  <section id="setup-needed" class="card" hidden>
+    <p>Point the extension at your server first.</p>
+    <button id="go-setup" class="primary block">Open settings</button>
+  </section>
+
+  <main id="main" hidden>
+    <nav id="tabs">
+      <button class="tab-btn active" data-tab="nowplaying">Now Playing</button>
+      <button class="tab-btn" data-tab="search">Search</button>
+      <button class="tab-btn" data-tab="activity">Activity</button>
+    </nav>
+
+    <div id="tab-nowplaying" class="tab-panel">
+      <section class="hero">
+        <div class="section-label">Now playing</div>
+        <div id="np-empty" class="muted">This page isn't reporting anything via its media session.</div>
+        <div id="np-card" class="np-card" hidden>
+          <div id="np-bg"></div>
+          <div class="np-content">
+          <div class="np-top">
+            <img id="np-art" alt="" />
+            <div class="np-meta">
+              <div id="np-title" class="np-title"></div>
+              <div id="np-artist"></div>
+              <div id="np-tags" class="tags"></div>
+              <div class="np-actions">
+                <button id="np-action" class="primary block slim">Wishlist</button>
+                <div class="np-subrow">
+                  <div id="np-state" class="muted tiny"></div>
+                  <div class="match-helpers">
+                    <button id="np-help-match" class="ghost" hidden>Help match</button>
+                    <button id="np-wrong-match" class="ghost" hidden>Not the right one?</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div id="np-match-panel" hidden>
+            <div class="row">
+              <input id="np-match-q" placeholder="Artist - Title" />
+              <button id="np-match-search">Search</button>
+            </div>
+            <ul id="np-match-results"></ul>
+          </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card" id="server-card" hidden>
+        <div class="row-between">
+          <span class="section-label">Your server</span>
+          <span class="server-head-right">
+            <span id="server-last-update" class="muted tiny"></span>
+            <button id="scan-open" class="ghost">Scan &#8599;</button>
+          </span>
+        </div>
+        <div id="server-stats"></div>
+        <div class="section-label rail-label">Recently added</div>
+        <div id="recent-rail" class="rail"></div>
+      </section>
+
+      <section class="card" id="release-card" hidden>
+        <div class="section-label">Release on this page</div>
+        <div id="rel-title" class="np-title"></div>
+        <div id="rel-sub" class="muted"></div>
+        <button id="rel-send" class="primary block">Send release to SoulSync</button>
+      </section>
+    </div>
+
+    <div id="tab-search" class="tab-panel" hidden>
+      <section class="card">
+        <div class="section-label">Manual search</div>
+        <div class="search-row">
+          <input id="manual-q" placeholder="Artist, title, or album…" autocomplete="off" spellcheck="false" />
+        </div>
+        <div id="manual-state" class="muted tiny manual-state">Search across your metadata sources.</div>
+        <ul id="manual-results"></ul>
+      </section>
+
+      <section class="card">
+        <div class="section-label">Text import</div>
+        <textarea id="import-text" rows="2" placeholder="Artist - Title, one per line…"></textarea>
+        <div class="row">
+          <button id="import-parse">Parse</button>
+          <select id="import-dest">
+            <option value="wishlist">Wishlist</option>
+            <option value="playlist">Playlist…</option>
+          </select>
+          <input id="import-playlist-name" placeholder="Playlist name" hidden />
+        </div>
+        <ul id="import-list"></ul>
+        <button id="import-send" class="primary block" hidden>Send to SoulSync</button>
+      </section>
+    </div>
+
+    <div id="tab-activity" class="tab-panel" hidden>
+      <section class="card sact-card-wrap" id="server-activity-card">
+        <div class="row-between">
+          <span class="section-label"><span class="sact-live-dot"></span>Server activity</span>
+          <span id="sact-server" class="muted tiny"></span>
+        </div>
+        <div class="sact-tabs" id="sact-tabs">
+          <button class="sact-tab sact-tab--on" data-sact="activity">Activity</button>
+          <button class="sact-tab" data-sact="history">History</button>
+          <button class="sact-tab" data-sact="stats">Stats</button>
+        </div>
+        <div class="sact-body" id="sact-body"></div>
+      </section>
+
+      <section class="card">
+        <div class="row-between">
+          <span class="section-label">Recent activity <span id="history-count" class="muted"></span></span>
+          <button id="history-clear" class="ghost">Clear</button>
+        </div>
+        <ul id="history-list"></ul>
+      </section>
+    </div>
+
+    <div id="status" class="muted"></div>
+  </main>
+
+  <script src="popup.js"></script>
+</body>
+</html>

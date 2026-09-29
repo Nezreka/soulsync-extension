@@ -1,0 +1,50 @@
+:root {
+  color-scheme: dark;
+  --bg: #14101f;
+  --text: #ece7f5;
+  --muted: #9a90b3;
+  --accent: #a855f7;
+  --danger: #f87171;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 system-ui, sans-serif;
+}
+
+main { max-width: 480px; margin: 40px auto; padding: 0 20px; }
+h1 { font-size: 20px; }
+.muted { color: var(--muted); }
+.hint { font-size: 12px; }
+
+label { display: block; margin: 14px 0; }
+input {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin-top: 6px;
+  background: #100c1a;
+  color: var(--text);
+  border: 1px solid #3b3054;
+  border-radius: 8px;
+  padding: 9px 11px;
+  font: inherit;
+}
+
+.row { display: flex; gap: 10px; margin-top: 16px; }
+button {
+  background: #2c2340;
+  color: var(--text);
+  border: 1px solid #3b3054;
+  border-radius: 8px;
+  padding: 9px 16px;
+  cursor: pointer;
+  font: inherit;
+}
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button:disabled { opacity: 0.5; cursor: default; }
+
+#note { margin-top: 14px; min-height: 1.4em; }
+#note.error { color: var(--danger); }

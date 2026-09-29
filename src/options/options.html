@@ -1,0 +1,35 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <link rel="stylesheet" href="options.css" />
+</head>
+<body>
+  <main>
+    <h1>SoulSync Companion — Settings</h1>
+    <p class="muted">
+      Point the extension at your server. Generate an API key on the server's
+      Settings page. Everything stays on this machine.
+    </p>
+    <label>
+      Server URL
+      <input id="server-url" placeholder="http://192.168.1.10:8080" />
+    </label>
+    <label>
+      API key
+      <input id="api-key" type="password" placeholder="paste from SoulSync Settings" />
+    </label>
+    <div class="row">
+      <button id="test" class="primary">Test connection</button>
+      <button id="save">Save</button>
+    </div>
+    <p class="hint muted">
+      Test connection also asks the browser for permission to reach your
+      server's host — required for the extension to call it. Keys look like
+      <code>sk_…</code> and act with the admin profile's rights.
+    </p>
+    <div id="note" class="muted"></div>
+  </main>
+  <script src="options.js"></script>
+</body>
+</html>

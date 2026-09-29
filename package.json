@@ -1,0 +1,21 @@
+{
+  "description": "Browser companion for SoulSync \u2014 send what's playing, selected text, or release pages straight to your server.",
+  "devDependencies": {
+    "@types/chrome": "^0.0.280",
+    "@types/webextension-polyfill": "^0.12.6",
+    "archiver": "^8.0.0",
+    "esbuild": "^0.24.2",
+    "typescript": "^5.6.3",
+    "webextension-polyfill": "^0.12.0"
+  },
+  "name": "soulsync-companion",
+  "private": true,
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit",
+    "package": "npm run build && node scripts/package.mjs"
+  },
+  "type": "module",
+  "version": "0.1.0"
+}
