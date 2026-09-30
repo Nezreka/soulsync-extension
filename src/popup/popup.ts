@@ -4,13 +4,15 @@ import { cleanNowPlaying } from '../shared/types.js';
 import { parseSelection } from '../shared/parse.js';
 import {
   addToWishlist,
+  BADGES_ENABLED_KEY,
+  badgesEnabledFromStored,
   directArtwork,
   getConfig,
   getRecentlyAdded,
   getServerStats,
   getWishlistCount,
   importToPlaylist,
-  lookupLibraryTrack,
+  lookupLibraryTrackSmart,
   pickBest,
   removeFromWishlist,
   searchTracks,
@@ -248,7 +250,7 @@ async function resolveNpServerState(): Promise<void> {
       return;
     }
     const [inLibrary, ids] = await Promise.all([
-      lookupLibraryTrack(cfg, source, hit.id),
+      lookupLibraryTrackSmart(cfg, source, hit.id, hit.title, hit.artist),
       wishlistIds(),
     ]);
     npState = { hit, inLibrary, onWishlist: ids.includes(hit.id) };
@@ -379,7 +381,7 @@ async function pickManualHit(hit: TrackHit): Promise<void> {
   toggleMatchPanel(false);
   setNpStateLine('Checking your pick…');
   const [inLibrary, ids] = await Promise.all([
-    lookupLibraryTrack(cfg, matchSource, hit.id),
+    lookupLibraryTrackSmart(cfg, matchSource, hit.id, hit.title, hit.artist),
     wishlistIds(),
   ]);
   npState = { hit, inLibrary, onWishlist: ids.includes(hit.id) };
@@ -450,7 +452,7 @@ async function loadRelease(): Promise<void> {
   $('release-card').hidden = false;
   $('rel-title').textContent = `${currentRelease.artist} — ${currentRelease.title}`;
   $('rel-sub').textContent = [currentRelease.source, currentRelease.label, `${currentRelease.tracks.length} tracks`]
-    .filter((s) => s.length > 0)
+    .filter((s): s is string => typeof s === 'string' && s.length > 0)
     .join(' · ');
 }
 
@@ -697,9 +699,11 @@ async function renderManualResults(tracks: TrackHit[]): Promise<void> {
     paintManualRow(row);
     list.appendChild(li);
     // Library state resolves progressively — the row is usable immediately.
+    // Smart check: the same song on a different release (single vs album)
+    // still counts as in-library, so we never offer to wishlist a duplicate.
     void (async () => {
       try {
-        row.inLibrary = await lookupLibraryTrack(cfg!, manualSource, hit.id);
+        row.inLibrary = await lookupLibraryTrackSmart(cfg!, manualSource, hit.id, hit.title, hit.artist);
       } catch {
         row.inLibrary = null;
       }
@@ -934,9 +938,25 @@ function init(): void {
   );
 }
 
+/** Page-badges master switch in the header. Persisted in storage.local
+ *  (default ON); content scripts watch the key via storage.onChanged and
+ *  tear badges down / remount them immediately — no reload needed. */
+async function initBadgeToggle(): Promise<void> {
+  const el = document.getElementById('badge-toggle') as HTMLInputElement | null;
+  if (!el) return;
+  try {
+    el.checked = badgesEnabledFromStored(await browser.storage.local.get(BADGES_ENABLED_KEY));
+  } catch {
+    el.checked = true;
+  }
+  el.addEventListener('change', () => {
+    void browser.storage.local.set({ [BADGES_ENABLED_KEY]: el.checked }).catch(() => undefined);
+  });
+}
+
 document.addEventListener('DOMContentLoaded', () => {
-  init();
-  void (async () => {
+  void initBadgeToggle();
+  init();  void (async () => {
     renderHistory(await loadHistory());
     cfg = await getConfig();
     if (!cfg) {

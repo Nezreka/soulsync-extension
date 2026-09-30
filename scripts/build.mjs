@@ -24,6 +24,9 @@ await build({
 });
 
 // Content scripts and UI scripts as self-contained IIFE bundles.
+// The '.css': 'text' loader lets page-badges.ts import its stylesheet as a
+// string, bundling it into the JS — no runtime fetch of a
+// chrome-extension:// URL, which Chrome refuses on some pages.
 await build({
   entryPoints: [
     join(src, 'content/media-session.ts'),
@@ -36,12 +39,14 @@ await build({
   bundle: true,
   format: 'iife',
   platform: 'browser',
+  loader: { '.css': 'text' },
   outbase: src,
   outdir,
 });
 
-// Static HTML/CSS.
-for (const f of ['popup/popup.html', 'popup/popup.css', 'options/options.html', 'options/options.css', 'content/page-badges.css']) {
+// Static HTML/CSS (page-badges.css is bundled into page-badges.js as a
+// string via the esbuild text loader — it is not copied or fetched).
+for (const f of ['popup/popup.html', 'popup/popup.css', 'options/options.html', 'options/options.css']) {
   const dest = join(outdir, f);
   await mkdir(dirname(dest), { recursive: true });
   await cp(join(src, f), dest);

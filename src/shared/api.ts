@@ -27,14 +27,15 @@ interface Envelope {
   success?: boolean;
   data?: Record<string, unknown>;
   error?: { code?: string; message?: string } | string;
+  pagination?: { total?: number; page?: number; limit?: number };
 }
 
 function baseUrl(cfg: ServerConfig): string {
   return cfg.url.replace(/\/+$/, '');
 }
 
-/** Fetch and unwrap the v1 envelope; throw on transport or API errors. */
-async function apiFetch(cfg: ServerConfig, path: string, init: RequestInit = {}): Promise<Record<string, unknown>> {
+/** Fetch the v1 envelope without unwrapping it; throw on transport or API errors. */
+async function apiFetchEnvelope(cfg: ServerConfig, path: string, init: RequestInit = {}): Promise<Envelope> {
   const res = await fetch(baseUrl(cfg) + path, {
     ...init,
     headers: {
@@ -49,6 +50,12 @@ async function apiFetch(cfg: ServerConfig, path: string, init: RequestInit = {})
     const msg = typeof err === 'string' ? err : err?.message || `Server returned ${res.status}`;
     throw new Error(msg);
   }
+  return envelope;
+}
+
+/** Fetch and unwrap the v1 envelope; throw on transport or API errors. */
+async function apiFetch(cfg: ServerConfig, path: string, init: RequestInit = {}): Promise<Record<string, unknown>> {
+  const envelope = await apiFetchEnvelope(cfg, path, init);
   return envelope.data ?? {};
 }
 
@@ -259,7 +266,9 @@ export async function addToWishlist(
   return wishlistTrack(cfg, best);
 }
 
-/** Wishlist every track of a page-aware release. */
+/** Wishlist every track of a page-aware release. Each track is resolved via
+ *  the server's automatic metadata source (source:'auto'); release.source is
+ *  provenance only and never steers the lookup. */
 export async function wishlistRelease(cfg: ServerConfig, release: ReleaseInfo): Promise<number> {
   let n = 0;
   for (const title of release.tracks) {
@@ -293,17 +302,137 @@ export async function lookupLibraryTrack(
 ): Promise<boolean | null> {
   if (!LOOKUP_PROVIDERS.has(provider) || !id) return null;
   try {
-    const url =
-      `${cfg.url.replace(/\/+$/, '')}${V1}/library/lookup?type=track` +
-      `&provider=${encodeURIComponent(provider)}&id=${encodeURIComponent(id)}`;
-    const res = await fetch(url, { headers: { Authorization: `Bearer ${cfg.apiKey}` } });
-    if (res.status === 404) return false;
+    const rec = await lookupLibraryTrackRecord(cfg, provider, id);
+    return rec ? true : false;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Well-known release qualifiers stripped for "same song, different release"
+ * matching. Conservative: only these exact words/phrases count, so
+ * "Song - Live" matches "Song" but "Star" never matches "Starburster".
+ */
+const VERSION_QUALIFIERS = [
+  'remaster', 'remastered', 'remastered version', 'remaster version',
+  'single version', 'album version', 'radio edit', 'radio version',
+  'extended version', 'extended mix', 'deluxe', 'deluxe edition',
+  'deluxe version', 'anniversary edition', 'anniversary', 'reissue',
+  'reissued', 'mono', 'stereo', 'live', 'acoustic', 'acoustic version',
+  'demo', 'demo version', 'instrumental', 'instrumental version',
+  'sped up', 'slowed', 'slowed down', 'nightcore',
+];
+
+/**
+ * Reduce a track title to its base form for cross-release matching:
+ * strips a trailing " - qualifier", " (qualifier)" or " [qualifier]" when the
+ * qualifier is a recognized version word. Returns the normalized base title.
+ * If nothing strips, returns the normalized title unchanged.
+ *
+ * Matching happens on the RAW title first: normName strips the
+ * parens/brackets/dashes the qualifiers live in, so a normalized-only
+ * match can never see them.
+ */
+function isVersionQualifier(rawQualifier: string): boolean {
+  const q = normName(rawQualifier);
+  if (VERSION_QUALIFIERS.includes(q)) return true;
+  // "2024 remaster", "2011 remastered version" — year + qualifier
+  const yearQ = q.match(/^(\d{4})\s+(.+)$/);
+  return !!yearQ && VERSION_QUALIFIERS.includes(yearQ[2]);
+}
+
+export function baseTitleForMatch(title: string): string {
+  let t = title;
+  // Spotify soundtrack/compilation attribution: 'Song - From "Album"' /
+  // 'Song - From Album'. The library holds "Song" — strip before matching.
+  const from = t.match(/^(.*)\s+[-–—]\s+From\s+.+$/i);
+  if (from) t = from[1].trim();
+  // Featured-artist parentheticals are credits, not the song title:
+  // "luther (with sza)" matches library "Luther". Case-insensitive.
+  const feat = t.match(/^(.*?)\s*\((?:with|feat\.?|ft\.?|featuring)\s+[^)]+\)$/i);
+  if (feat) t = feat[1].trim();
+  // trailing " - qualifier" on the raw title
+  const dash = t.match(/^(.*)[-–—]\s*([^-–—()\[\]]+)$/);
+  if (dash && isVersionQualifier(dash[2])) return normName(dash[1]);
+  // trailing "(qualifier)" or "[qualifier]" on the raw title
+  const paren = t.match(/^(.*)[\(\[]\s*([^\)\]]+?)\s*[\)\]]$/);
+  if (paren && isVersionQualifier(paren[2])) return normName(paren[1]);
+  return normName(t);
+}
+
+/** Primary artist for matching: strips "feat./ft./featuring/with" credits. */
+export function primaryArtistForMatch(artist: string): string {
+  return normName(artist)
+    .replace(/\s+(feat\.?|ft\.?|featuring|with)\s+.*$/, '')
+    .trim();
+}
+
+/** Does a library track row represent the same song as the query? */
+function libraryRowMatchesSong(
+  queryTitle: string, queryArtist: string, row: { title?: string; artist_name?: string },
+): boolean {
+  const rowTitle = normName(row.title ?? '');
+  const rowArtist = primaryArtistForMatch(row.artist_name ?? '');
+  const qArtist = primaryArtistForMatch(queryArtist);
+  if (!rowTitle || !rowArtist || !qArtist) return false;
+  if (rowArtist !== qArtist) return false;
+  const qTitle = normName(queryTitle);
+  if (rowTitle === qTitle) return true;
+  // Same song on a different release: "Song (Remastered)" vs "Song".
+  return baseTitleForMatch(row.title ?? '') === baseTitleForMatch(queryTitle)
+    && baseTitleForMatch(queryTitle) !== '';
+}
+
+/**
+ * Smart "is this song in the library" check. A provider-ID-only lookup misses
+ * the same song filed under a different release (single vs album version), so:
+ *   1. Try the exact provider-ID lookup first (strongest signal).
+ *   2. Fall back to the server's library track search by title+artist, then
+ *      verify each hit client-side with strict normalized matching to rule
+ *      out the server's fuzzy false positives.
+ * Tri-state: true = verified in library, false = verified absent after both
+ * checks, null = couldn't verify (transport/server/parse failure).
+ */
+export async function lookupLibraryTrackSmart(
+  cfg: ServerConfig,
+  provider: string,
+  id: string,
+  title: string,
+  artist: string,
+): Promise<boolean | null> {
+  // 1. Exact provider-ID lookup — strongest signal.
+  let idResult: boolean | null = null;
+  if (LOOKUP_PROVIDERS.has(provider) && id) {
+    try {
+      const rec = await lookupLibraryTrackRecord(cfg, provider, id);
+      idResult = rec ? true : false;
+    } catch {
+      idResult = null;
+    }
+    if (idResult === true) return true;
+  }
+  // 2. Title+artist library search with strict client-side verification.
+  //    (The server search is fuzzy by design — it finds candidates, not answers.)
+  if (!title || !artist) return idResult === false ? false : null;
+  try {
+    const base = cfg.url.replace(/\/+$/, '');
+    const params = new URLSearchParams({
+      title: title.slice(0, 200),
+      artist: artist.slice(0, 200),
+      limit: '25',
+    });
+    const res = await fetch(`${base}${V1}/library/tracks?${params}`, {
+      headers: { Authorization: `Bearer ${cfg.apiKey}` },
+    });
     if (!res.ok) return null;
-    const envelope = (await res.json().catch(() => ({}))) as {
-      success?: boolean;
-      data?: { track?: unknown };
-    };
-    return envelope.success === true && !!envelope.data?.track;
+    const envelope = (await res.json().catch(() => null)) as {
+      success?: boolean; data?: { tracks?: { title?: string; artist_name?: string }[] };
+    } | null;
+    if (!envelope || envelope.success === false) return null;
+    const tracks = envelope.data?.tracks ?? [];
+    const matched = tracks.some((t) => libraryRowMatchesSong(title, artist, t));
+    return matched ? true : false;
   } catch {
     return null;
   }
@@ -347,7 +476,7 @@ export async function importToPlaylist(
 /* ── page badges ── */
 
 export interface BadgeCandidate {
-  kind: 'artist' | 'album';
+  kind: 'artist' | 'album' | 'track';
   name: string;
   /** album artist, when known — tightens the library match */
   artist?: string;
@@ -433,6 +562,35 @@ async function libraryArtistId(cfg: ServerConfig, name: string): Promise<number 
 }
 
 /**
+ * The library album id for an exact title under a library artist id.
+ * null = no exact match (or unresolvable) — never throws for "absent",
+ * throws on transport errors so callers keep the tri-state.
+ */
+async function libraryAlbumId(
+  cfg: ServerConfig,
+  artistId: number,
+  title: string,
+): Promise<number | null> {
+  const wantTitle = normName(title);
+  if (wantTitle.length === 0) return null;
+  const data = await apiFetch(
+    cfg,
+    `${V1}/library/albums?search=${encodeURIComponent(title)}&artist_id=${artistId}&limit=10`,
+    { method: 'GET' },
+  );
+  const albums = data.albums;
+  if (!Array.isArray(albums)) return null;
+  for (const a of albums) {
+    const o = a as { title?: unknown; id?: unknown };
+    if (typeof o.title === 'string' && normName(o.title) === wantTitle) {
+      const id = Number(o.id);
+      if (Number.isFinite(id)) return id;
+    }
+  }
+  return null;
+}
+
+/**
  * Strict album match, associated through the artist — never title-only.
  * The artist name resolves to a library artist id, then the title must match
  * exactly among THAT artist's albums. A title match under a different artist
@@ -456,18 +614,7 @@ async function libraryHasAlbum(
       badgeCache.set(key, false);
       return false;
     }
-    const data = await apiFetch(
-      cfg,
-      `${V1}/library/albums?search=${encodeURIComponent(title)}&artist_id=${artistId}&limit=10`,
-      { method: 'GET' },
-    );
-    const albums = data.albums;
-    const found =
-      Array.isArray(albums) &&
-      albums.some((a: unknown) => {
-        const t = (a as { title?: unknown }).title;
-        return typeof t === 'string' && normName(t) === wantTitle;
-      });
+    const found = (await libraryAlbumId(cfg, artistId, title)) !== null;
     badgeCache.set(key, found);
     return found;
   } catch {
@@ -475,9 +622,86 @@ async function libraryHasAlbum(
   }
 }
 
+export interface LibraryLink {
+  /** Full URL. '' when nothing could be resolved. */
+  url: string;
+  /** True when the URL lands on the exact entity (not a filtered grid). */
+  exact: boolean;
+}
+
+/**
+ * Deep link into the user's SoulSync for a badge candidate: the artist-detail
+ * page, with ?album=<id> when the album can be pinned (the page opens and
+ * scrolls to it). Falls back to the filtered library grid; '' when the
+ * inputs are empty. Never throws — callers get the fallback, not an error.
+ */
+export async function resolveLibraryLink(
+  cfg: ServerConfig,
+  kind: 'artist' | 'album' | 'track',
+  name: string,
+  artist?: string,
+): Promise<LibraryLink> {
+  const origin = serverOrigin(cfg);
+  const fallback: LibraryLink =
+    kind === 'artist'
+      ? { url: `${origin}/library?q=${encodeURIComponent(name)}`, exact: false }
+      : { url: `${origin}/library?view=albums&q=${encodeURIComponent(name)}`, exact: false };
+  if (normName(name).length === 0) return { url: '', exact: false };
+  try {
+    if (kind === 'artist') {
+      const id = await libraryArtistId(cfg, name);
+      if (typeof id === 'number')
+        return { url: `${origin}/artist-detail/library/${id}`, exact: true };
+    } else if (kind === 'album' && artist && normName(artist).length > 0) {
+      const artistId = await libraryArtistId(cfg, artist);
+      if (typeof artistId === 'number') {
+        const albumId = await libraryAlbumId(cfg, artistId, name);
+        const base = `${origin}/artist-detail/library/${artistId}`;
+        return albumId !== null
+          ? { url: `${base}?album=${albumId}`, exact: true }
+          : { url: base, exact: false };
+      }
+    } else if (kind === 'track' && artist && normName(artist).length > 0) {
+      const rec = await resolveLibraryTrackRecord(cfg, artist, name);
+      if (rec && typeof rec.artist_id === 'number') {
+        const base = `${origin}/artist-detail/library/${rec.artist_id}`;
+        return {
+          url: typeof rec.album_id === 'number' ? `${base}?album=${rec.album_id}` : base,
+          exact: true,
+        };
+      }
+      const artistId = await libraryArtistId(cfg, artist);
+      if (typeof artistId === 'number')
+        return { url: `${origin}/artist-detail/library/${artistId}`, exact: false };
+    }
+  } catch {
+    /* fall through to the filtered grid */
+  }
+  return fallback;
+}
+
+/**
+ * The library track row for bare "artist - title" metadata: resolved through
+ * the server's own search, then the best hit's provider id. null when
+ * unresolvable. Throws on transport errors (unknown, never false "absent").
+ */
+async function resolveLibraryTrackRecord(
+  cfg: ServerConfig,
+  artist: string,
+  title: string,
+): Promise<LibraryTrackRecord | null> {
+  const { tracks: hits, source } = await searchTracks(cfg, `${artist} - ${title}`, 5);
+  const best = pickBest(hits, { artist, title });
+  if (!best || !best.id) return null;
+  return lookupLibraryTrackRecord(cfg, source, best.id);
+}
+
 /** Batch library check for badge candidates. Tri-state per item: true =
  *  in library, false = verified absent, null = couldn't verify. Never
- *  throws — item errors surface as null, never as a false "not in library". */
+ *  throws — item errors surface as null, never as a false "not in library".
+ *  Track candidates are resolved through the server's own search first
+ *  (YouTube gives no provider track id); an unresolvable track is null,
+ *  never a false "not in library". */
 export async function lookupBadgeStatuses(
   cfg: ServerConfig,
   items: BadgeCandidate[],
@@ -489,10 +713,48 @@ export async function lookupBadgeStatuses(
       out[key] =
         it.kind === 'artist'
           ? await libraryHasArtist(cfg, it.name)
-          : await libraryHasAlbum(cfg, it.name, it.artist);
+          : it.kind === 'track'
+            ? await libraryHasTrack(cfg, it.name, it.artist ?? '')
+            : await libraryHasAlbum(cfg, it.name, it.artist);
     }),
   );
   return out;
+}
+
+/**
+ * Is "artist - title" in the library? Resolves the bare metadata through
+ * the server's own track search, then checks the best hit's provider id —
+ * the same two calls the popup's per-row library state uses. Tri-state:
+ * true = the resolved track is in the library, false = resolved but
+ * absent, null = couldn't resolve or couldn't check.
+ */
+async function libraryHasTrack(
+  cfg: ServerConfig,
+  title: string,
+  artist: string,
+): Promise<boolean | null> {
+  const key = badgeKey('track', title, artist);
+  const cached = badgeCache.get(key);
+  if (cached !== undefined) return cached;
+  if (normName(title).length === 0 || normName(artist).length === 0) return null;
+  try {
+    const { tracks: hits, source } = await searchTracks(cfg, `${artist} - ${title}`, 5);
+    const best = pickBest(hits, { artist, title });
+    // Smart check: exact provider-ID first, then title+artist library search.
+    // Catches the same song filed under a different release (single vs album).
+    const inLibrary = await lookupLibraryTrackSmart(
+      cfg,
+      source,
+      best?.id ?? '',
+      title,
+      artist,
+    );
+    if (inLibrary === null) return null;
+    badgeCache.set(key, inLibrary);
+    return inLibrary;
+  } catch {
+    return null;
+  }
 }
 
 export interface ArtistHit {
@@ -502,6 +764,46 @@ export interface ArtistHit {
   /** Provider the hit came from ("spotify", "deezer", …) — the search
    *  response names it; watchlist/add needs it for numeric ids. */
   source: string;
+}
+
+/** A library track row as returned by /api/v1/library/lookup (subset we use). */
+export interface LibraryTrackRecord {
+  id: number;
+  album_id: number | null;
+  artist_id: number | null;
+  title: string;
+}
+
+/**
+ * The library track row for a provider track id. null = not in the library
+ * (404 or unparseable); THROWS on transport/server errors so callers can keep
+ * the tri-state (unknown, never a false "absent").
+ */
+export async function lookupLibraryTrackRecord(
+  cfg: ServerConfig,
+  provider: string,
+  id: string,
+): Promise<LibraryTrackRecord | null> {
+  if (!LOOKUP_PROVIDERS.has(provider) || !id) return null;
+  const url =
+    `${cfg.url.replace(/\/+$/, '')}${V1}/library/lookup?type=track` +
+    `&provider=${encodeURIComponent(provider)}&id=${encodeURIComponent(id)}`;
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${cfg.apiKey}` } });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`library lookup failed: ${res.status}`);
+  const envelope = (await res.json().catch(() => ({}))) as {
+    success?: boolean;
+    data?: { track?: Record<string, unknown> };
+  };
+  const t = envelope.success === true ? envelope.data?.track : undefined;
+  if (!t || typeof t.id !== 'number') return null;
+  const num = (v: unknown): number | null => (typeof v === 'number' ? v : null);
+  return {
+    id: t.id,
+    album_id: num(t.album_id),
+    artist_id: num(t.artist_id),
+    title: typeof t.title === 'string' ? t.title : '',
+  };
 }
 
 /** POST /api/v1/search/artists — resolve a page artist name to a provider id. */
@@ -557,6 +859,59 @@ export async function watchArtist(
   const data = (await res.json().catch(() => ({}))) as { success?: boolean; error?: unknown };
   if (!res.ok || data.success === false) {
     throw new Error(typeof data.error === 'string' && data.error ? data.error : `Server returned ${res.status}`);
+  }
+}
+
+/**
+ * POST /api/watchlist/remove — non-v1 route, so the key rides as ?api_key=.
+ * Body is {artist_id}. Throws with the server's message on error.
+ */
+export async function unwatchArtist(cfg: ServerConfig, artistId: string): Promise<void> {
+  const base = cfg.url.replace(/\/+$/, '');
+  const url = `${base}/api/watchlist/remove?api_key=${encodeURIComponent(cfg.apiKey)}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ artist_id: artistId }),
+  });
+  const data = (await res.json().catch(() => ({}))) as { success?: boolean; error?: unknown };
+  if (!res.ok || data.success === false) {
+    throw new Error(typeof data.error === 'string' && data.error ? data.error : `Server returned ${res.status}`);
+  }
+}
+
+/**
+ * POST /api/watchlist/check — non-v1 route, so the key rides as ?api_key=.
+ * Returns true when the artist is on the watchlist, false when not, and
+ * null when the check itself failed — never claim "not watching" on error.
+ */
+export async function checkWatchlist(
+  cfg: ServerConfig,
+  artistId: string,
+): Promise<boolean | null> {
+  const base = cfg.url.replace(/\/+$/, '');
+  const url = `${base}/api/watchlist/check?api_key=${encodeURIComponent(cfg.apiKey)}`;
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ artist_id: artistId }),
+    });
+    const data = (await res.json().catch(() => null)) as {
+      success?: boolean;
+      is_watching?: unknown;
+      error?: unknown;
+    } | null;
+    // Malformed JSON = couldn't verify. Never claim "not watching" on a
+    // parse failure.
+    if (data === null) return null;
+    if (!res.ok || data.success === false) return null;
+    // The real /api/watchlist/check returns is_watching TOP-LEVEL
+    // ({"success": true, "is_watching": bool}) — this is what SoulSync's own
+    // watchlist button reads (webui -artist-detail.watchlist-button.ts).
+    return data.is_watching === true;
+  } catch {
+    return null;
   }
 }
 
@@ -624,8 +979,11 @@ export async function getRecentlyAdded(cfg: ServerConfig, limit = 12): Promise<R
 
 /** Wishlist size, via the list endpoint's pagination total (limit=1 = cheap). */
 export async function getWishlistCount(cfg: ServerConfig): Promise<number> {
-  const data = await apiFetch(cfg, `${V1}/wishlist?limit=1`, { method: 'GET' });
-  return typeof data.total === 'number' ? data.total : 0;
+  // The server's envelope puts the total in `pagination.total`, not in `data`
+  // — apiFetch() unwraps only `data`, so read the full envelope here.
+  const envelope = await apiFetchEnvelope(cfg, `${V1}/wishlist?limit=1`, { method: 'GET' });
+  const total = envelope.pagination?.total;
+  return typeof total === 'number' && Number.isFinite(total) ? total : 0;
 }
 
 /**
@@ -683,4 +1041,323 @@ export function directArtwork(cfg: ServerConfig, url: string): string {
   if (u.startsWith('//')) return `https:${u}`;
   const base = cfg.url.replace(/\/+$/, '');
   return base + (u.startsWith('/') ? u : `/${u}`);
+}
+
+/* ── mirrored playlists (save-playlist) ── */
+
+/** Playlist sources the mirror endpoints accept. */
+export type PlaylistSource = 'spotify' | 'deezer';
+
+export interface SpotifyPlaylistTrack {
+  id: string;
+  name: string;
+  artists?: { name?: string }[];
+  album?: { name?: string; images?: { url?: string }[] };
+  duration_ms?: number;
+  spotify_track_id?: string;
+}
+
+export interface DeezerPlaylistTrack {
+  id: string | number;
+  name: string;
+  /** Deezer gives bare name strings, not {name} objects. */
+  artists?: string[];
+  /** Deezer gives the album as a bare string. */
+  album?: string;
+  album_cover_url?: string;
+  duration_ms?: number;
+}
+
+export interface PlaylistDetail<T = SpotifyPlaylistTrack | DeezerPlaylistTrack> {
+  id: string;
+  name: string;
+  description: string;
+  owner: string;
+  track_count: number;
+  image_url: string;
+  tracks: T[];
+}
+
+export interface MirrorTrack {
+  track_name: string;
+  artist_name: string;
+  album_name: string;
+  duration_ms: number;
+  image_url: string | null;
+  source_track_id: string;
+  extra_data: null;
+}
+
+export interface MirrorPlaylistPayload {
+  source: PlaylistSource;
+  source_playlist_id: string;
+  name: string;
+  description: string;
+  owner: string;
+  image_url: string;
+  tracks: MirrorTrack[];
+}
+
+/**
+ * Non-v1 routes ride the key as ?api_key= (see watchArtist — honored since
+ * server PR #1380). These endpoints answer plain JSON ({error: "..."} as a
+ * string on failure), not the v1 envelope. Throws the server's message.
+ */
+async function nonV1Fetch(
+  cfg: ServerConfig,
+  path: string,
+  init: RequestInit = {},
+): Promise<Record<string, unknown>> {
+  const base = cfg.url.replace(/\/+$/, '');
+  const sep = path.includes('?') ? '&' : '?';
+  const url = `${base}${path}${sep}api_key=${encodeURIComponent(cfg.apiKey)}`;
+  const res = await fetch(url, {
+    ...init,
+    headers: { 'Content-Type': 'application/json', ...(init.headers || {}) },
+  });
+  const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+  if (!res.ok) {
+    const err = data.error;
+    throw new Error(typeof err === 'string' && err ? err : `Server returned ${res.status}`);
+  }
+  // A 2xx can still carry an API-level failure ({success: false, error} or
+  // {error}) — never treat it as success.
+  const err = data.error;
+  if (typeof err === 'string' && err) throw new Error(err);
+  if (data.success === false) throw new Error(typeof err === 'string' && err ? err : 'Request failed');
+  return data;
+}
+
+function str(v: unknown): string {
+  return typeof v === 'string' ? v : '';
+}
+
+function num(v: unknown): number {
+  return typeof v === 'number' && Number.isFinite(v) ? v : 0;
+}
+
+function ownerName(v: unknown): string {
+  if (typeof v === 'string') return v;
+  if (v && typeof v === 'object') {
+    const o = v as Record<string, unknown>;
+    if (typeof o.display_name === 'string') return o.display_name;
+    if (typeof o.name === 'string') return o.name;
+  }
+  return '';
+}
+
+function normalizeSpotifyPlaylist(data: Record<string, unknown>): PlaylistDetail<SpotifyPlaylistTrack> {
+  const raw = Array.isArray(data.tracks) ? data.tracks : [];
+  return {
+    // Deezer IDs arrive numeric from the real API — normalize to string.
+    id: data.id === undefined || data.id === null ? '' : String(data.id),
+    name: str(data.name),
+    description: str(data.description),
+    owner: ownerName(data.owner),
+    track_count: num(data.track_count),
+    image_url: str(data.image_url),
+    tracks: raw.map((t) => {
+      const o = (t ?? {}) as Record<string, unknown>;
+      const artists = Array.isArray(o.artists) ? o.artists : [];
+      const album = (o.album ?? {}) as Record<string, unknown>;
+      const images = Array.isArray(album.images) ? album.images : [];
+      return {
+        id: str(o.id),
+        name: str(o.name),
+        artists: artists.map((a) => ({
+          name: str((a as { name?: unknown } | null)?.name),
+        })),
+        album: {
+          name: str(album.name),
+          images: images.map((im) => ({ url: str((im as { url?: unknown } | null)?.url) })),
+        },
+        duration_ms: num(o.duration_ms),
+        spotify_track_id:
+          typeof o.spotify_track_id === 'string' ? o.spotify_track_id : undefined,
+      };
+    }),
+  };
+}
+
+function normalizeDeezerPlaylist(data: Record<string, unknown>): PlaylistDetail<DeezerPlaylistTrack> {
+  const raw = Array.isArray(data.tracks) ? data.tracks : [];
+  return {
+    // Deezer IDs arrive numeric from the real API — normalize to string.
+    id: data.id === undefined || data.id === null ? '' : String(data.id),
+    name: str(data.name),
+    description: str(data.description),
+    owner: ownerName(data.owner),
+    track_count: num(data.track_count),
+    image_url: str(data.image_url),
+    tracks: raw.map((t) => {
+      const o = (t ?? {}) as Record<string, unknown>;
+      const artists = Array.isArray(o.artists) ? o.artists : [];
+      return {
+        id: typeof o.id === 'string' || typeof o.id === 'number' ? o.id : '',
+        name: str(o.name),
+        artists: artists.map((a) =>
+          typeof a === 'string' ? a : str((a as { name?: unknown } | null)?.name),
+        ),
+        album: str(o.album),
+        album_cover_url:
+          typeof o.album_cover_url === 'string' ? o.album_cover_url : undefined,
+        duration_ms: num(o.duration_ms),
+      };
+    }),
+  };
+}
+
+/**
+ * Is this provider playlist already mirrored on the server?
+ * → {found: true, playlist} or {found: false, playlist: null}.
+ */
+export async function resolveMirroredPlaylist(
+  cfg: ServerConfig,
+  source: PlaylistSource,
+  ref: string,
+): Promise<{ found: boolean; playlist: Record<string, unknown> | null }> {
+  const data = await nonV1Fetch(
+    cfg,
+    `/api/mirrored-playlists/resolve?ref=${encodeURIComponent(ref)}&source=${encodeURIComponent(source)}`,
+  );
+  return {
+    found: data.found === true,
+    playlist: (data.playlist as Record<string, unknown> | null) ?? null,
+  };
+}
+
+/**
+ * Full Spotify playlist with tracks (the server proxies its own Spotify
+ * connection). 401 {"error": "Spotify not authenticated."} when the server's
+ * Spotify isn't linked — the message passes through honestly; the caller
+ * maps it to the "connect Spotify first" guidance.
+ */
+export async function getSpotifyPlaylistTracks(
+  cfg: ServerConfig,
+  id: string,
+): Promise<PlaylistDetail<SpotifyPlaylistTrack>> {
+  const data = await nonV1Fetch(cfg, `/api/spotify/playlist/${encodeURIComponent(id)}`);
+  return normalizeSpotifyPlaylist(data);
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Full Deezer playlist with tracks. Public Deezer data — no server auth
+ * needed. Sync first; when the server 202s (large playlist), fall back to
+ * the async job (?async=1 → {job_id}, poll /api/deezer/playlist-load/<job_id>).
+ */
+export async function getDeezerPlaylistTracks(
+  cfg: ServerConfig,
+  id: string,
+): Promise<PlaylistDetail<DeezerPlaylistTrack>> {
+  const base = cfg.url.replace(/\/+$/, '');
+  const key = `api_key=${encodeURIComponent(cfg.apiKey)}`;
+  const url = (extra: string) =>
+    `${base}/api/deezer/playlist/${encodeURIComponent(id)}${extra}${extra.includes('?') ? '&' : '?'}${key}`;
+  const readJson = async (res: Response): Promise<Record<string, unknown>> =>
+    (await res.json().catch(() => ({}))) as Record<string, unknown>;
+  const throwFor = (res: Response, data: Record<string, unknown>): never => {
+    const err = data.error;
+    throw new Error(typeof err === 'string' && err ? err : `Server returned ${res.status}`);
+  };
+
+  const first = await fetch(url(''));
+  if (first.status !== 202) {
+    const data = await readJson(first);
+    if (!first.ok) throwFor(first, data);
+    return normalizeDeezerPlaylist(data);
+  }
+  // Large playlist: the sync call 202'd. Start the async job…
+  let job = await readJson(first);
+  let jobId = typeof job.job_id === 'string' ? job.job_id : '';
+  if (!jobId) {
+    const started = await fetch(url('?async=1'));
+    job = await readJson(started);
+    jobId = typeof job.job_id === 'string' ? job.job_id : '';
+  }
+  if (!jobId) throw new Error('The server accepted the playlist but gave no job to follow.');
+  // …and poll until it lands.
+  for (let i = 0; i < 90; i++) {
+    await sleep(2000);
+    const pr = await fetch(`${base}/api/deezer/playlist-load/${encodeURIComponent(jobId)}?${key}`);
+    if (pr.status === 202) continue;
+    const pd = await readJson(pr);
+    if (!pr.ok) throwFor(pr, pd);
+    if (pd.status === 'error') {
+      const err = pd.error;
+      throw new Error(typeof err === 'string' && err ? err : 'Playlist load failed.');
+    }
+    const pl = (pd.playlist ?? pd) as Record<string, unknown>;
+    if (pd.status === 'done' || Array.isArray(pl.tracks)) return normalizeDeezerPlaylist(pl);
+  }
+  throw new Error('Timed out waiting for the playlist tracks to load.');
+}
+
+/** Spotify track → the mirror endpoint's track shape. */
+export function spotifyPlaylistTrackToMirror(t: SpotifyPlaylistTrack): MirrorTrack {
+  return {
+    track_name: t.name ?? '',
+    artist_name: t.artists?.[0]?.name ?? '',
+    album_name: t.album?.name ?? '',
+    duration_ms: t.duration_ms ?? 0,
+    image_url: t.album?.images?.[0]?.url ?? null,
+    source_track_id: t.spotify_track_id || t.id,
+    extra_data: null,
+  };
+}
+
+/** Deezer track → the mirror endpoint's track shape. */
+export function deezerPlaylistTrackToMirror(t: DeezerPlaylistTrack): MirrorTrack {
+  return {
+    track_name: t.name ?? '',
+    artist_name: t.artists?.[0] ?? '',
+    album_name: t.album ?? '',
+    duration_ms: t.duration_ms ?? 0,
+    image_url: t.album_cover_url ?? null,
+    source_track_id: String(t.id ?? ''),
+    extra_data: null,
+  };
+}
+
+/**
+ * POST /api/mirror-playlist — mirrors the provider playlist on the server.
+ * → the server's mirrored playlist id.
+ */
+export async function mirrorPlaylist(
+  cfg: ServerConfig,
+  payload: MirrorPlaylistPayload,
+): Promise<number> {
+  const data = await nonV1Fetch(cfg, '/api/mirror-playlist', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+  const id = Number(data.playlist_id);
+  if (!Number.isFinite(id)) {
+    const err = data.error;
+    throw new Error(typeof err === 'string' && err ? err : 'The server did not return a playlist id.');
+  }
+  return id;
+}
+
+/** POST /api/mirrored-playlists/<id>/prepare-discovery — kicks off discovery. */
+export async function preparePlaylistDiscovery(cfg: ServerConfig, mirroredId: number): Promise<void> {
+  await nonV1Fetch(cfg, `/api/mirrored-playlists/${mirroredId}/prepare-discovery`, {
+    method: 'POST',
+  });
+}
+
+/** Storage key for the page-badges master switch (popup toggle). */
+export const BADGES_ENABLED_KEY = 'soulsync_badges_enabled';
+
+/**
+ * Resolve the badge switch from a `storage.local.get()` result.
+ * Default is ON — badges are the core feature; only an explicit `false`
+ * disables them. Anything else (unset, true, junk) means enabled.
+ */
+export function badgesEnabledFromStored(stored: unknown): boolean {
+  if (stored !== null && typeof stored === 'object' && BADGES_ENABLED_KEY in stored) {
+    return (stored as Record<string, unknown>)[BADGES_ENABLED_KEY] !== false;
+  }
+  return true;
 }

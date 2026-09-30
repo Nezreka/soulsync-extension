@@ -11,6 +11,11 @@
       <span class="brand-name">SoulSync</span>
       <span class="brand-sub">COMPANION</span>
     </div>
+    <label class="badge-toggle" title="Show page badges on supported sites">
+      <span class="badge-toggle-label">Badges</span>
+      <input type="checkbox" id="badge-toggle" checked />
+      <span class="switch" aria-hidden="true"></span>
+    </label>
     <span id="conn-dot" class="dot" title="Server connection"></span>
     <a href="#" id="open-server" class="icon-btn" title="Open SoulSync">&#8599;</a>
     <a href="#" id="open-options" class="icon-btn" title="Settings">&#9881;</a>
@@ -100,7 +105,7 @@
         <div class="section-label">Text import</div>
         <textarea id="import-text" rows="2" placeholder="Artist - Title, one per line…"></textarea>
         <div class="row">
-          <button id="import-parse">Parse</button>
+          <button id="import-parse" class="secondary">Parse</button>
           <select id="import-dest">
             <option value="wishlist">Wishlist</option>
             <option value="playlist">Playlist…</option>

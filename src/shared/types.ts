@@ -21,10 +21,16 @@ export interface ParsedTrack {
   ok: boolean;
 }
 
-export type ReleaseSource = 'bandcamp' | 'beatport' | 'spotify' | 'soundcloud' | 'deezer' | 'tidal';
+export type ReleaseSource = 'bandcamp' | 'beatport' | 'spotify' | 'soundcloud' | 'deezer' | 'tidal' | 'youtube';
 
 export interface ReleaseInfo {
-  source: ReleaseSource;
+  /**
+   * Which page provider this release came from, when known. Provenance only:
+   * the wishlist pipeline resolves every track through the server's
+   * automatic metadata source (see doSearch), so this never steers which
+   * provider fulfills the wishlist.
+   */
+  source?: ReleaseSource;
   artist: string;
   title: string;
   label: string;

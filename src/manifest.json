@@ -56,7 +56,8 @@
         "*://*.bandcamp.com/*",
         "*://*.soundcloud.com/*",
         "*://*.deezer.com/*",
-        "*://*.tidal.com/*"
+        "*://*.tidal.com/*",
+        "*://*.youtube.com/*"
       ],
       "run_at": "document_idle"
     }
@@ -83,21 +84,10 @@
     "http://*/*",
     "https://*/*"
   ],
-  "options_page": "options/options.html",
-  "web_accessible_resources": [
-    {
-      "resources": [
-        "content/page-badges.css"
-      ],
-      "matches": [
-        "*://open.spotify.com/*",
-        "*://*.bandcamp.com/*",
-        "*://*.soundcloud.com/*",
-        "*://*.deezer.com/*",
-        "*://*.tidal.com/*"
-      ]
-    }
+  "host_permissions": [
+    "https://api.deezer.com/*"
   ],
+  "options_page": "options/options.html",
   "permissions": [
     "storage",
     "contextMenus",
