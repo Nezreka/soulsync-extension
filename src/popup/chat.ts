@@ -373,7 +373,6 @@ export class ChatTab {
   mount(host: HTMLElement): void {
     host.innerHTML = `
       <div class="chat-wrap">
-        <div class="chat-rail" id="chat-rail"></div>
         <div class="chat-main">
           <div class="chat-head">
             <div class="chat-head-top">
@@ -384,6 +383,7 @@ export class ChatTab {
                 <button class="chat-icon-btn" id="chat-settings-btn" title="Chat settings" hidden>⚙️</button>
               </div>
             </div>
+            <div class="chat-rail" id="chat-rail"></div>
             <div class="chat-channels" id="chat-channels" hidden></div>
             <div class="chat-topic" id="chat-topic" hidden></div>
           </div>
@@ -705,23 +705,25 @@ export class ChatTab {
     const s = this.s;
     const rail = this.els['chat-rail'];
     const rooms = s.rooms.length ? s.rooms : [{ name: s.homeRoom || s.room || 'SoulSync', home: true }];
-    let html = '<div class="chat-rail-label">Rooms</div>';
+    let html = '';
     html += rooms.map((r) => {
       const on = s.view === 'room' && s.room === r.name;
-      const initials = r.name.replace(/[^A-Za-z0-9]/g, '').slice(0, 2).toUpperCase() || '#';
-      return `<button class="chat-guild${on ? ' chat-guild--on' : ''}" type="button" data-open-room="${esc(r.name)}" title="${esc(r.name)}">${r.home ? '🎵' : esc(initials)}</button>`;
+      return `<button class="chat-chip${on ? ' chat-chip--on' : ''}" type="button" data-open-room="${esc(r.name)}" title="${esc(r.name)}">${r.home ? '🎵 ' : ''}${esc(r.name)}</button>`;
     }).join('');
     if (s.canManage) {
-      html += `<button class="chat-guild chat-guild--add" type="button" data-room-browser title="Browse / join rooms">＋</button>`;
+      html += `<button class="chat-chip chat-chip--add" type="button" data-room-browser title="Browse / join rooms">＋</button>`;
     }
-    html += '<div class="chat-rail-label">DMs</div>';
     const visible = s.convos.filter((c) => !s.hiddenDms.has(c.username));
-    html += visible.map((c) => {
-      const on = s.view === 'pm' && s.pmUser === c.username;
-      const dot = c.unread ? '<span class="chat-dot"></span>' : '';
-      return `<button class="chat-guild chat-guild--dm${on ? ' chat-guild--on' : ''}" type="button" data-open-pm="${esc(c.username)}" title="${esc(c.username)}">${dot}${esc(c.username.replace(/[^A-Za-z0-9]/g, '').slice(0, 2).toUpperCase() || '?')}</button>`;
-    }).join('');
+    if (visible.length) {
+      html += '<span class="chat-chip-sep"></span>';
+      html += visible.map((c) => {
+        const on = s.view === 'pm' && s.pmUser === c.username;
+        const dot = c.unread ? '<span class="chat-dot"></span>' : '';
+        return `<button class="chat-chip chat-chip--dm${on ? ' chat-chip--on' : ''}" type="button" data-open-pm="${esc(c.username)}" title="DM ${esc(c.username)}">${dot}💬 ${esc(c.username)}</button>`;
+      }).join('');
+    }
     rail.innerHTML = html;
+    rail.hidden = !html;
   }
 
   private chanRoom(): boolean {
@@ -878,6 +880,53 @@ export class ChatTab {
     searchInput.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') this.toggleSearch(false);
     });
+    // Click-and-drag horizontal scrolling for the rail + channel strips.
+    this.dragScroll(this.els['chat-rail'], 'chat-rail--dragging');
+    this.dragScroll(this.els['chat-channels'], 'chat-channels--dragging');
+  }
+
+  /** Click-and-drag to scroll a horizontal strip. Suppresses the click if
+      the pointer moved far enough to count as a drag. */
+  private dragScroll(el: HTMLElement, draggingClass: string): void {
+    let down = false;
+    let dragging = false;
+    let startX = 0;
+    let startScroll = 0;
+    el.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0 && e.pointerType === 'mouse') return;
+      down = true;
+      dragging = false;
+      startX = e.clientX;
+      startScroll = el.scrollLeft;
+      el.classList.remove(draggingClass);
+    });
+    el.addEventListener('pointermove', (e) => {
+      if (!down) return;
+      const dx = e.clientX - startX;
+      if (!dragging && Math.abs(dx) > 6) {
+        dragging = true;
+        el.classList.add(draggingClass);
+      }
+      if (dragging) {
+        el.scrollLeft = startScroll - dx;
+      }
+    });
+    const end = () => {
+      down = false;
+      el.classList.remove(draggingClass);
+      // dragging stays true until the next pointerdown so the follow-up
+      // click (dispatched after pointerup) is still suppressed.
+    };
+    el.addEventListener('pointerup', end);
+    el.addEventListener('pointercancel', end);
+    // Swallow clicks that were actually drags. Capture phase runs before
+    // the delegated click handler.
+    el.addEventListener('click', (e) => {
+      if (dragging) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    }, true);
   }
 
   /** Delegated data-act handler for message action buttons. */
