@@ -880,53 +880,6 @@ export class ChatTab {
     searchInput.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') this.toggleSearch(false);
     });
-    // Click-and-drag horizontal scrolling for the rail + channel strips.
-    this.dragScroll(this.els['chat-rail'], 'chat-rail--dragging');
-    this.dragScroll(this.els['chat-channels'], 'chat-channels--dragging');
-  }
-
-  /** Click-and-drag to scroll a horizontal strip. Suppresses the click if
-      the pointer moved far enough to count as a drag. */
-  private dragScroll(el: HTMLElement, draggingClass: string): void {
-    let down = false;
-    let dragging = false;
-    let startX = 0;
-    let startScroll = 0;
-    el.addEventListener('pointerdown', (e) => {
-      if (e.button !== 0 && e.pointerType === 'mouse') return;
-      down = true;
-      dragging = false;
-      startX = e.clientX;
-      startScroll = el.scrollLeft;
-      el.classList.remove(draggingClass);
-    });
-    el.addEventListener('pointermove', (e) => {
-      if (!down) return;
-      const dx = e.clientX - startX;
-      if (!dragging && Math.abs(dx) > 6) {
-        dragging = true;
-        el.classList.add(draggingClass);
-      }
-      if (dragging) {
-        el.scrollLeft = startScroll - dx;
-      }
-    });
-    const end = () => {
-      down = false;
-      el.classList.remove(draggingClass);
-      // dragging stays true until the next pointerdown so the follow-up
-      // click (dispatched after pointerup) is still suppressed.
-    };
-    el.addEventListener('pointerup', end);
-    el.addEventListener('pointercancel', end);
-    // Swallow clicks that were actually drags. Capture phase runs before
-    // the delegated click handler.
-    el.addEventListener('click', (e) => {
-      if (dragging) {
-        e.preventDefault();
-        e.stopPropagation();
-      }
-    }, true);
   }
 
   /** Delegated data-act handler for message action buttons. */

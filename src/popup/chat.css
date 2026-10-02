@@ -6,7 +6,8 @@
 /* The chat tab wants the full popup height: the body scrolls, but the chat
    panel pins its own message column. */
 #tab-chat {
-  height: 520px;
+  height: 100%;
+  overflow: hidden;
 }
 
 .chat-wrap {
@@ -16,18 +17,14 @@
   min-height: 0;
 }
 
-/* ── rail: horizontal rooms + DMs strip ── */
+/* ── rail: horizontal rooms + DMs strip (wraps, no scrolling needed) ── */
 .chat-rail {
   display: flex;
   gap: 6px;
   align-items: center;
-  overflow-x: auto;
+  flex-wrap: wrap;
   padding: 2px 2px 8px;
-  scrollbar-width: none;
-  cursor: grab;
 }
-.chat-rail::-webkit-scrollbar { display: none; }
-.chat-rail--dragging { cursor: grabbing; }
 .chat-rail[hidden] { display: none; }
 .chat-chip {
   flex: none;
@@ -108,13 +105,9 @@
   display: flex;
   gap: 4px;
   align-items: center;
-  overflow-x: auto;
+  flex-wrap: wrap;
   padding: 0 2px 8px;
-  scrollbar-width: none;
-  cursor: grab;
 }
-.chat-channels::-webkit-scrollbar { display: none; }
-.chat-channels--dragging { cursor: grabbing; }
 .chat-channels[hidden] { display: none; }
 .chat-chancat {
   font-size: 9px;
