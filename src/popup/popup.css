@@ -30,6 +30,12 @@ body {
   background:
     radial-gradient(130% 34% at 50% -8%, rgba(162, 89, 255, 0.14), transparent 62%),
     var(--bg);
+  transition: width 0.18s ease;
+}
+/* The chat tab gets room to breathe. */
+body.tab-chat-active {
+  width: 620px;
+}
   color: var(--text);
   font: 13px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui,
     "Segoe UI", Roboto, sans-serif;

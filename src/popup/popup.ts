@@ -588,6 +588,7 @@ function selectTab(name: TabName): void {
   void browser.storage.local.set({ [LAST_TAB_KEY]: name });
   serverActivity?.setActive(name === 'activity');
   chatTab?.setActive(name === 'chat');
+  document.body.classList.toggle('tab-chat-active', name === 'chat');
   if (name === 'search') {
     const q = $('manual-q') as HTMLInputElement;
     // Focus without scrolling the popup under the user's fingers.
@@ -980,6 +981,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const visibleTab = document.querySelector<HTMLButtonElement>('#tabs .tab-btn.active');
     serverActivity?.setActive(visibleTab?.dataset.tab === 'activity');
     chatTab?.setActive(visibleTab?.dataset.tab === 'chat');
+    document.body.classList.toggle('tab-chat-active', visibleTab?.dataset.tab === 'chat');
     // Server extras load in the background — they never block now playing.
     void loadServerExtras();
     await guard(async () => {
