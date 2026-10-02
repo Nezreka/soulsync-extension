@@ -9,6 +9,8 @@ import {
   directArtwork,
   getConfig,
   getRecentlyAdded,
+  getRecentlyAddedVideos,
+  getVideoStats,
   getServerStats,
   getWishlistCount,
   importToPlaylist,
@@ -20,6 +22,8 @@ import {
   wishlistRelease,
   wishlistTrack,
   type RecentAlbum,
+  type RecentVideo,
+  type VideoStats,
   type ServerStats,
   type TrackHit,
 } from '../shared/api.js';
@@ -463,7 +467,7 @@ function fmtNum(n: number): string {
   return n.toLocaleString('en-US');
 }
 
-function renderStats(stats: ServerStats, wishlistCount: number): void {
+function renderStats(stats: ServerStats, wishlistCount: number, video: VideoStats | null): void {
   const el = $('server-stats');
   el.innerHTML = '';
 
@@ -481,13 +485,36 @@ function renderStats(stats: ServerStats, wishlistCount: number): void {
     c.append(n, l);
     return c;
   };
+  const musicLabel = document.createElement('div');
+  musicLabel.className = 'section-label stats-group-label';
+  musicLabel.textContent = 'Music';
+  el.appendChild(musicLabel);
   grid.append(
     cell(fmtNum(stats.tracks), 'tracks'),
     cell(fmtNum(stats.artists), 'artists'),
     cell(fmtNum(stats.albums), 'albums'),
-    cell(fmtNum(wishlistCount), 'on wishlist'),
+    cell(fmtNum(wishlistCount), 'wishlist'),
   );
   el.appendChild(grid);
+
+  if (video && (video.movies > 0 || video.shows > 0)) {
+    const videoLabel = document.createElement('div');
+    videoLabel.className = 'section-label stats-group-label';
+    videoLabel.textContent = 'Video';
+    el.appendChild(videoLabel);
+    const vgrid = document.createElement('div');
+    vgrid.className = 'stats-grid stats-video';
+    const vCells: HTMLElement[] = [
+      cell(fmtNum(video.movies), 'movies'),
+      cell(fmtNum(video.shows), 'tv shows'),
+      cell(fmtNum(video.episodes), 'episodes'),
+      cell(fmtNum(video.wishlist), 'wishlist'),
+    ];
+    // Episodes hides when the server predates the total_episodes field.
+    if (video.episodes === 0) vCells[2].style.display = 'none';
+    vgrid.append(...vCells);
+    el.appendChild(vgrid);
+  }
 
   const pill = $('dl-pill');
   pill.hidden = false;
@@ -541,12 +568,52 @@ function renderRail(cfg: ServerConfig, albums: RecentAlbum[]): void {
   }
 }
 
+function renderVideoRail(cfg: ServerConfig, videos: RecentVideo[]): void {
+  const rail = $('recent-video-rail');
+  rail.innerHTML = '';
+  if (videos.length === 0) {
+    const d = document.createElement('div');
+    d.className = 'muted tiny';
+    d.textContent = 'Nothing added yet.';
+    rail.appendChild(d);
+    return;
+  }
+  for (const v of videos) {
+    const item = document.createElement('div');
+    item.className = 'rail-item';
+    // TMDB CDN URLs are public — load directly. Anything else goes through
+    // the server artwork pipeline (proxy + API key).
+    const thumb = v.thumb.trim();
+    const isTmdbCdn = /^https?:\/\/image\.tmdb\.org\//i.test(thumb);
+    const art = isTmdbCdn ? thumb : serverArtwork(cfg, thumb);
+    item.appendChild(
+      art
+        ? artImg('rail-art', 'rail-art rail-art-ph', art, isTmdbCdn ? thumb : directArtwork(cfg, thumb))
+        : (() => { const ph = document.createElement('div'); ph.className = 'rail-art rail-art-ph'; ph.title = 'no artwork url from server'; return ph; })(),
+    );
+    const t = document.createElement('div');
+    t.className = 'rail-title';
+    t.textContent = v.title;
+    t.title = v.title;
+    const sub = document.createElement('div');
+    sub.className = 'rail-sub muted';
+    const at = v.addedAt ? new Date(v.addedAt).getTime() : NaN;
+    sub.textContent = [v.kind === 'show' ? 'TV' : 'Movie', v.year ? String(v.year) : '', Number.isFinite(at) ? relativeTime(at) : '']
+      .filter(Boolean)
+      .join(' · ');
+    item.append(t, sub);
+    rail.appendChild(item);
+  }
+}
+
 /** Shimmer placeholders shown in the server card while it loads. */
 function renderServerSkeleton(): void {
   const stats = $('server-stats');
   stats.innerHTML = '<div class="skel-stats"><div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div></div>';
   const rail = $('recent-rail');
   rail.innerHTML = '<div class="skel-rail"><div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div></div>';
+  const vrail = $('recent-video-rail');
+  vrail.innerHTML = '<div class="skel-rail"><div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div></div>';
 }
 
 /**
@@ -558,13 +625,16 @@ async function loadServerExtras(): Promise<void> {
   $('server-card').hidden = false;
   renderServerSkeleton();
   try {
-    const [stats, albums, wishlistCount] = await Promise.all([
+    const [stats, albums, videos, wishlistCount, videoStats] = await Promise.all([
       getServerStats(cfg),
       getRecentlyAdded(cfg, 12),
+      getRecentlyAddedVideos(cfg, 12),
       getWishlistCount(cfg),
+      getVideoStats(cfg),
     ]);
-    renderStats(stats, wishlistCount);
+    renderStats(stats, wishlistCount, videoStats);
     renderRail(cfg, albums);
+    renderVideoRail(cfg, videos);
   } catch {
     $('server-card').hidden = true;
   }

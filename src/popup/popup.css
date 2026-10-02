@@ -429,6 +429,12 @@ button.slim { padding-top: 9px; padding-bottom: 9px; font-size: 13.5px; }
   gap: 8px;
   margin: 2px 0 12px;
 }
+.stats-grid.stats-video {
+  grid-template-columns: repeat(4, 1fr);
+  margin-top: -6px;
+}
+.stats-group-label { margin-bottom: 6px; }
+.stats-group-label:not(:first-child) { margin-top: 4px; }
 .stat-cell .n {
   font-size: 15px;
   font-weight: 700;
@@ -438,7 +444,8 @@ button.slim { padding-top: 9px; padding-bottom: 9px; font-size: 13.5px; }
 .stat-cell .l { font-size: 10px; color: var(--muted); margin-top: 1px; }
 
 .rail-label { margin-bottom: 8px; }
-#recent-rail {
+#recent-rail,
+#recent-video-rail {
   display: flex;
   gap: 10px;
   overflow-x: auto;

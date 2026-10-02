@@ -948,6 +948,47 @@ export async function getServerStats(cfg: ServerConfig): Promise<ServerStats> {
   };
 }
 
+export interface VideoStats {
+  movies: number;
+  shows: number;
+  episodes: number;
+  wishlist: number;
+}
+
+/** Video library counts via pagination totals (limit=1 = cheap). */
+export async function getVideoStats(cfg: ServerConfig): Promise<VideoStats> {
+  const count = async (kind: string): Promise<{ total: number; episodes: number }> => {
+    try {
+      // Video library nests pagination inside data (unlike wishlist which
+      // puts it at the envelope top level).
+      const data = await apiFetch(cfg, `${V1}/video/library?kind=${kind}&limit=1`, { method: 'GET' });
+      const p = data.pagination as Record<string, unknown> | undefined;
+      const total = p?.total_count ?? p?.total;
+      const ep = (data as Record<string, unknown>).total_episodes;
+      return {
+        total: typeof total === 'number' && Number.isFinite(total) ? total : 0,
+        episodes: typeof ep === 'number' && Number.isFinite(ep) ? ep : 0,
+      };
+    } catch {
+      return { total: 0, episodes: 0 };
+    }
+  };
+  const [movies, shows, wishlist] = await Promise.all([
+    count('movies'),
+    count('shows'),
+    (async () => {
+      try {
+        const data = await apiFetch(cfg, `${V1}/video/wishlist/counts`, { method: 'GET' });
+        const total = (data as Record<string, unknown>).total;
+        return typeof total === 'number' && Number.isFinite(total) ? total : 0;
+      } catch {
+        return 0;
+      }
+    })(),
+  ]);
+  return { movies: movies.total, shows: shows.total, episodes: shows.episodes, wishlist };
+}
+
 export interface RecentAlbum {
   id: number;
   title: string;
@@ -975,6 +1016,309 @@ export async function getRecentlyAdded(cfg: ServerConfig, limit = 12): Promise<R
       addedAt: typeof o.created_at === 'string' ? o.created_at : '',
     };
   });
+}
+
+export interface RecentVideo {
+  id: number;
+  title: string;
+  kind: 'movie' | 'show';
+  year: number | null;
+  thumb: string;
+  addedAt: string;
+}
+
+/** GET /api/v1/video/library?sort=added — newest movies/shows to land. */
+export async function getRecentlyAddedVideos(cfg: ServerConfig, limit = 12): Promise<RecentVideo[]> {
+  const data = await apiFetch(
+    cfg,
+    `${V1}/video/library?sort=added&limit=${Math.min(50, Math.max(1, limit))}`,
+    { method: 'GET' },
+  );
+  const items = (data as Record<string, unknown>).items ?? data;
+  if (!Array.isArray(items)) return [];
+  return items.map((it: unknown) => {
+    const o = it as Record<string, unknown>;
+    const kind: 'movie' | 'show' = o.kind === 'show' || o.media_type === 'show' ? 'show' : 'movie';
+    const id = typeof o.id === 'number' ? o.id : 0;
+    // The list endpoint omits poster_url for perf (only has_poster boolean).
+    // Build the direct poster endpoint URL from the id.
+    const hasPoster = o.has_poster === true;
+    const thumb = hasPoster && id > 0
+      ? `/api/video/poster/${kind}/${id}`
+      : (typeof o.poster_url === 'string' ? o.poster_url : '');
+    return {
+      id,
+      title: typeof o.title === 'string' ? o.title : 'Untitled',
+      kind,
+      year: typeof o.year === 'number' ? o.year : null,
+      thumb,
+      addedAt: typeof o.added_at === 'string' ? o.added_at
+        : typeof o.date_added === 'string' ? o.date_added
+        : typeof o.created_at === 'string' ? o.created_at : '',
+    };
+  });
+}
+
+export interface VideoSearchHit {
+  tmdbId: number;
+  title: string;
+  kind: 'movie' | 'show';
+  year: number | null;
+  posterUrl: string;
+}
+
+/** TMDB multi-search via the server. ?q=<text> */
+export async function searchVideo(cfg: ServerConfig, query: string): Promise<VideoSearchHit[]> {
+  const data = await apiFetch(cfg, `${V1}/video/search?q=${encodeURIComponent(query)}`, { method: 'GET' });
+  const results = (data as Record<string, unknown>).results;
+  if (!Array.isArray(results)) return [];
+  return results.map((r: unknown) => {
+    const o = r as Record<string, unknown>;
+    const kind: 'movie' | 'show' = o.media_type === 'tv' || o.kind === 'show' ? 'show' : 'movie';
+    return {
+      tmdbId: typeof o.tmdb_id === 'number' ? o.tmdb_id : (typeof o.id === 'number' ? o.id : 0),
+      title: typeof o.title === 'string' ? o.title : (typeof o.name === 'string' ? o.name : ''),
+      kind,
+      year: typeof o.year === 'number' ? o.year : null,
+      posterUrl: typeof o.poster === 'string' ? o.poster
+        : typeof o.poster_url === 'string' ? o.poster_url : '',
+    };
+  }).filter((h) => h.tmdbId > 0 && h.title);
+}
+
+/** Tri-state: is this TMDB id in the video library?
+ * Searches by title (the library search is title-only), then verifies by
+ * TMDB id first, falling back to normalized title + year — the same
+ * exact-id-then-fuzzy shape the music badges use. */
+export async function videoInLibrary(
+  cfg: ServerConfig,
+  tmdbId: number,
+  kind: 'movie' | 'show',
+  title: string,
+  year: number | null,
+): Promise<boolean | null> {
+  try {
+    const data = await apiFetch(
+      cfg,
+      `${V1}/video/library?kind=${kind === 'show' ? 'shows' : 'movies'}&search=${encodeURIComponent(title)}&limit=10`,
+      { method: 'GET' },
+    );
+    const items = (data as Record<string, unknown>).items;
+    if (!Array.isArray(items) || items.length === 0) return false;
+    const normTitle = title.toLowerCase().trim();
+    for (const it of items) {
+      const o = it as Record<string, unknown>;
+      if (o.tmdb_id === tmdbId) return true;
+    }
+    // Fallback: normalized title + year match.
+    for (const it of items) {
+      const o = it as Record<string, unknown>;
+      const t = typeof o.title === 'string' ? o.title.toLowerCase().trim() : '';
+      const y = typeof o.year === 'number' ? o.year : null;
+      if (t === normTitle && (year === null || y === null || y === year)) return true;
+    }
+    return false;
+  } catch {
+    return null;
+  }
+}
+
+/** Is a specific episode in the library? Uses the episode-level endpoint. */
+export async function episodeInLibrary(
+  cfg: ServerConfig,
+  showTmdbId: number,
+  season: number,
+  episode: number,
+): Promise<boolean | null> {
+  try {
+    const data = await apiFetch(
+      cfg,
+      `${V1}/video/library/episode?tmdb_id=${showTmdbId}&season=${season}&episode=${episode}`,
+      { method: 'GET' },
+    );
+    const v = (data as Record<string, unknown>).in_library;
+    return typeof v === 'boolean' ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Tri-state: is this TMDB id on the video wishlist?
+ * Title search + TMDB id verification, same shape as the library check. */
+export async function videoOnWishlist(
+  cfg: ServerConfig,
+  tmdbId: number,
+  kind: 'movie' | 'show',
+  title: string,
+): Promise<boolean | null> {
+  try {
+    const data = await apiFetch(
+      cfg,
+      `${V1}/video/wishlist?kind=${kind === 'show' ? 'show' : 'movie'}&search=${encodeURIComponent(title)}&limit=10`,
+      { method: 'GET' },
+    );
+    const items = (data as Record<string, unknown>).items;
+    if (!Array.isArray(items) || items.length === 0) return false;
+    return items.some((it: unknown) => {
+      const o = it as Record<string, unknown>;
+      return o.tmdb_id === tmdbId;
+    });
+  } catch {
+    return null;
+  }
+}
+
+/** Tri-state: is this show on the watchlist (followed)?
+ * Title search + TMDB id verification. Requires kind=show or the endpoint
+ * returns the grouped view (no items array). */
+export async function showOnWatchlist(cfg: ServerConfig, tmdbId: number, title: string): Promise<boolean | null> {
+  try {
+    const data = await apiFetch(
+      cfg,
+      `${V1}/video/watchlist?kind=show&search=${encodeURIComponent(title)}&limit=10`,
+      { method: 'GET' },
+    );
+    const items = (data as Record<string, unknown>).items;
+    if (!Array.isArray(items) || items.length === 0) return false;
+    return items.some((it: unknown) => {
+      const o = it as Record<string, unknown>;
+      return o.tmdb_id === tmdbId;
+    });
+  } catch {
+    return null;
+  }
+}
+
+/** Add a movie/show to the video wishlist. Returns true on success. */
+export async function addVideoToWishlist(
+  cfg: ServerConfig,
+  hit: VideoSearchHit,
+  episode?: { season: number; episode: number },
+): Promise<boolean> {
+  try {
+    let body: Record<string, unknown>;
+    if (episode) {
+      // Episode wishlist: show + specific episodes.
+      body = {
+        show: { tmdb_id: hit.tmdbId, title: hit.title, poster_url: hit.posterUrl || undefined },
+        episodes: [{ season_number: episode.season, episode_number: episode.episode }],
+      };
+    } else {
+      body = hit.kind === 'movie'
+        ? { movie: { tmdb_id: hit.tmdbId, title: hit.title, year: hit.year ?? undefined, poster_url: hit.posterUrl || undefined } }
+        : { show: { tmdb_id: hit.tmdbId, title: hit.title, poster_url: hit.posterUrl || undefined } };
+    }
+    await apiFetch(cfg, `${V1}/video/wishlist`, { method: 'POST', body: JSON.stringify(body) });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Follow a show (add to watchlist). Returns true on success. */
+export async function addShowToWatchlist(cfg: ServerConfig, hit: VideoSearchHit): Promise<boolean> {
+  try {
+    await apiFetch(cfg, `${V1}/video/watchlist`, {
+      method: 'POST',
+      body: JSON.stringify({
+        tmdb_id: hit.tmdbId,
+        title: hit.title,
+        kind: 'show',
+        poster_url: hit.posterUrl || undefined,
+      }),
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Unfollow a show (remove from watchlist). Returns true on success. */
+export async function removeShowFromWatchlist(cfg: ServerConfig, tmdbId: number): Promise<boolean> {
+  try {
+    await apiFetch(cfg, `${V1}/video/watchlist`, {
+      method: 'DELETE',
+      body: JSON.stringify({ kind: 'show', tmdb_id: tmdbId }),
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export interface PersonSearchHit {
+  tmdbId: number;
+  name: string;
+  posterUrl: string;
+}
+
+/** Find people via the server's multi-search. */
+export async function searchPerson(cfg: ServerConfig, query: string): Promise<PersonSearchHit[]> {
+  const data = await apiFetch(cfg, `${V1}/video/search?q=${encodeURIComponent(query)}`, { method: 'GET' });
+  const results = (data as Record<string, unknown>).results;
+  if (!Array.isArray(results)) return [];
+  return results
+    .map((r: unknown) => {
+      const o = r as Record<string, unknown>;
+      // People come back as {kind: 'person', title: <name>, tmdb_id}.
+      if (o.kind !== 'person') return null;
+      return {
+        tmdbId: typeof o.tmdb_id === 'number' ? o.tmdb_id : (typeof o.id === 'number' ? o.id : 0),
+        name: typeof o.title === 'string' ? o.title : (typeof o.name === 'string' ? o.name : ''),
+        posterUrl: typeof o.poster === 'string' ? o.poster : (typeof o.poster_url === 'string' ? o.poster_url : ''),
+      };
+    })
+    .filter((h): h is PersonSearchHit => h !== null && h.tmdbId > 0 && !!h.name);
+}
+
+/** Tri-state: is this person on the watchlist? */
+export async function personOnWatchlist(cfg: ServerConfig, tmdbId: number, name: string): Promise<boolean | null> {
+  try {
+    const data = await apiFetch(
+      cfg,
+      `${V1}/video/watchlist?kind=person&search=${encodeURIComponent(name)}&limit=10`,
+      { method: 'GET' },
+    );
+    const items = (data as Record<string, unknown>).items;
+    if (!Array.isArray(items) || items.length === 0) return false;
+    return items.some((it: unknown) => {
+      const o = it as Record<string, unknown>;
+      return o.tmdb_id === tmdbId;
+    });
+  } catch {
+    return null;
+  }
+}
+
+/** Follow a person. Returns true on success. */
+export async function addPersonToWatchlist(cfg: ServerConfig, hit: PersonSearchHit): Promise<boolean> {
+  try {
+    await apiFetch(cfg, `${V1}/video/watchlist`, {
+      method: 'POST',
+      body: JSON.stringify({
+        kind: 'person',
+        tmdb_id: hit.tmdbId,
+        title: hit.name,
+        poster_url: hit.posterUrl || undefined,
+      }),
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Unfollow a person. Returns true on success. */
+export async function removePersonFromWatchlist(cfg: ServerConfig, tmdbId: number): Promise<boolean> {
+  try {
+    await apiFetch(cfg, `${V1}/video/watchlist`, {
+      method: 'DELETE',
+      body: JSON.stringify({ kind: 'person', tmdb_id: tmdbId }),
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Wishlist size, via the list endpoint's pagination total (limit=1 = cheap). */
@@ -1013,6 +1357,10 @@ export function serverArtwork(cfg: ServerConfig, url: string): string {
     return withKey(base + u + (u.includes('?') ? '' : '?v=rail'));
   }
   if (u.startsWith('/api/image-proxy')) {
+    return withKey(base + u);
+  }
+  if (u.startsWith('/api/video/poster/') || u.startsWith('/api/video/backdrop/')) {
+    // Server video artwork endpoints — key goes directly, no proxy needed.
     return withKey(base + u);
   }
   if (/^https?:\/\//i.test(u)) {

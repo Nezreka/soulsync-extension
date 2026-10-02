@@ -33,6 +33,7 @@ await build({
     join(src, 'content/bandcamp.ts'),
     join(src, 'content/beatport.ts'),
     join(src, 'content/page-badges.ts'),
+    join(src, 'content/video-badges.ts'),
     join(src, 'popup/popup.ts'),
     join(src, 'options/options.ts'),
   ],

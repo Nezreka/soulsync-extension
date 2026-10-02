@@ -60,6 +60,18 @@
         "*://*.youtube.com/*"
       ],
       "run_at": "document_idle"
+    },
+    {
+      "js": [
+        "content/video-badges.js"
+      ],
+      "matches": [
+        "*://*.imdb.com/*",
+        "*://*.themoviedb.org/*",
+        "*://*.trakt.tv/*",
+        "*://*.letterboxd.com/*"
+      ],
+      "run_at": "document_idle"
     }
   ],
   "description": "Send what's playing, selected text, or release pages straight to your SoulSync server.",
