@@ -1103,7 +1103,7 @@ export interface MirrorPlaylistPayload {
  * server PR #1380). These endpoints answer plain JSON ({error: "..."} as a
  * string on failure), not the v1 envelope. Throws the server's message.
  */
-async function nonV1Fetch(
+export async function nonV1Fetch(
   cfg: ServerConfig,
   path: string,
   init: RequestInit = {},

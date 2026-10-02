@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <link rel="stylesheet" href="popup.css" />
+  <link rel="stylesheet" href="chat.css" />
 </head>
 <body>
   <header>
@@ -31,6 +32,7 @@
       <button class="tab-btn active" data-tab="nowplaying">Now Playing</button>
       <button class="tab-btn" data-tab="search">Search</button>
       <button class="tab-btn" data-tab="activity">Activity</button>
+      <button class="tab-btn" data-tab="chat">Chat</button>
     </nav>
 
     <div id="tab-nowplaying" class="tab-panel">
@@ -139,6 +141,8 @@
         <ul id="history-list"></ul>
       </section>
     </div>
+
+    <div id="tab-chat" class="tab-panel" hidden></div>
 
     <div id="status" class="muted"></div>
   </main>

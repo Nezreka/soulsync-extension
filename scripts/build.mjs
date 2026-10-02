@@ -46,7 +46,7 @@ await build({
 
 // Static HTML/CSS (page-badges.css is bundled into page-badges.js as a
 // string via the esbuild text loader — it is not copied or fetched).
-for (const f of ['popup/popup.html', 'popup/popup.css', 'options/options.html', 'options/options.css']) {
+for (const f of ['popup/popup.html', 'popup/popup.css', 'popup/chat.css', 'options/options.html', 'options/options.css']) {
   const dest = join(outdir, f);
   await mkdir(dirname(dest), { recursive: true });
   await cp(join(src, f), dest);

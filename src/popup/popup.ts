@@ -25,6 +25,7 @@ import {
 } from '../shared/api.js';
 
 import { initServerActivity } from './activity.js';
+import { ChatTab } from './chat.js';
 
 const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
 
@@ -572,9 +573,10 @@ async function loadServerExtras(): Promise<void> {
 /* ── tabs ── */
 
 const LAST_TAB_KEY = 'soulsync_last_tab';
-type TabName = 'nowplaying' | 'search' | 'activity';
+type TabName = 'nowplaying' | 'search' | 'activity' | 'chat';
 
 let serverActivity: { setActive: (active: boolean) => void } | null = null;
+let chatTab: ChatTab | null = null;
 
 function selectTab(name: TabName): void {
   for (const btn of document.querySelectorAll<HTMLButtonElement>('#tabs .tab-btn')) {
@@ -585,6 +587,7 @@ function selectTab(name: TabName): void {
   }
   void browser.storage.local.set({ [LAST_TAB_KEY]: name });
   serverActivity?.setActive(name === 'activity');
+  chatTab?.setActive(name === 'chat');
   if (name === 'search') {
     const q = $('manual-q') as HTMLInputElement;
     // Focus without scrolling the popup under the user's fingers.
@@ -814,6 +817,8 @@ async function guard(fn: () => Promise<void>): Promise<void> {
 
 function init(): void {
   serverActivity = initServerActivity({ getCfg: () => cfg, setStatus });
+  chatTab = new ChatTab();
+  chatTab.mount(document.getElementById('tab-chat') as HTMLElement);
   $('open-options').addEventListener('click', (e) => {
     e.preventDefault();
     void browser.runtime.openOptionsPage();
@@ -967,13 +972,14 @@ document.addEventListener('DOMContentLoaded', () => {
     $('conn-dot').classList.add('ok');
     const storedTab = (await browser.storage.local.get(LAST_TAB_KEY)) as Record<string, unknown>;
     const lastTab = storedTab[LAST_TAB_KEY];
-    if (lastTab === 'search' || lastTab === 'activity' || lastTab === 'nowplaying') {
+    if (lastTab === 'search' || lastTab === 'activity' || lastTab === 'nowplaying' || lastTab === 'chat') {
       selectTab(lastTab);
     }
-    // selectTab only fires when restoring a stored tab — arm the activity
-    // poller for whichever tab is actually visible.
+    // selectTab only fires when restoring a stored tab — arm the pollers
+    // for whichever tab is actually visible.
     const visibleTab = document.querySelector<HTMLButtonElement>('#tabs .tab-btn.active');
     serverActivity?.setActive(visibleTab?.dataset.tab === 'activity');
+    chatTab?.setActive(visibleTab?.dataset.tab === 'chat');
     // Server extras load in the background — they never block now playing.
     void loadServerExtras();
     await guard(async () => {

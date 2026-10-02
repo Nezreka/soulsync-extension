@@ -1,26 +1,43 @@
-// Bundles tests/badge-logic.test.mjs with esbuild (real src code,
-// webextension-polyfill aliased to a stub), runs it under node, and cleans
+// Bundles each tests/*.test.mjs with esbuild (real src code,
+// webextension-polyfill aliased to a stub), runs them under node, and cleans
 // up. Exit code follows the test run.
 import { build } from 'esbuild';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const root = join(dirname(fileURLToPath(import.meta.url)), '..');
+const files = readdirSync(join(root, 'tests')).filter((f) => f.endsWith('.test.mjs')).sort();
+if (!files.length) {
+  console.error('no test files found');
+  process.exit(1);
+}
 
 const dir = mkdtempSync(join(tmpdir(), 'ssb-tests-'));
-const out = join(dir, 'badge-logic.test.bundle.mjs');
+let failed = 0;
 try {
-  await build({
-    entryPoints: ['tests/badge-logic.test.mjs'],
-    bundle: true,
-    format: 'esm',
-    platform: 'node',
-    outfile: out,
-    logLevel: 'error',
-    alias: { 'webextension-polyfill': './tests/polyfill-stub.mjs' },
-  });
-  const res = spawnSync(process.execPath, [out], { stdio: 'inherit' });
-  process.exit(res.status ?? 1);
+  for (const f of files) {
+    const out = join(dir, f.replace(/\.mjs$/, '.bundle.mjs'));
+    await build({
+      entryPoints: [join(root, 'tests', f)],
+      bundle: true,
+      format: 'esm',
+      platform: 'node',
+      outfile: out,
+      logLevel: 'error',
+      alias: { 'webextension-polyfill': './tests/polyfill-stub.mjs' },
+    });
+    console.log(`── ${f} ──`);
+    const res = spawnSync(process.execPath, [out], { stdio: 'inherit' });
+    if ((res.status ?? 1) !== 0) failed++;
+  }
 } finally {
   rmSync(dir, { recursive: true, force: true });
 }
+if (failed) {
+  console.error(`${failed} test file(s) FAILED`);
+  process.exit(1);
+}
+console.log('ALL TEST FILES PASSED');
