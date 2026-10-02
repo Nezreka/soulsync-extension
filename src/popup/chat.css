@@ -7,7 +7,6 @@
    panel pins its own message column. */
 #tab-chat {
   height: 520px;
-  max-height: calc(100vh - 130px);
 }
 
 .chat-wrap {
