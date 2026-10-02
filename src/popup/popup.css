@@ -30,9 +30,9 @@ body {
   background:
     radial-gradient(130% 34% at 50% -8%, rgba(162, 89, 255, 0.14), transparent 62%),
     var(--bg);
-  transition: width 0.18s ease;
 }
-/* The chat tab gets room to breathe. */
+/* The chat tab gets room to breathe. Note: no width transition — Chrome's
+   popup resize detection misses animated size changes. */
 body.tab-chat-active {
   width: 620px;
 }

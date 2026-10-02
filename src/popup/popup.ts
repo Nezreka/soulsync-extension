@@ -588,7 +588,10 @@ function selectTab(name: TabName): void {
   void browser.storage.local.set({ [LAST_TAB_KEY]: name });
   serverActivity?.setActive(name === 'activity');
   chatTab?.setActive(name === 'chat');
+  // Widen the popup for chat. Set via class (CSS) and force a reflow so
+  // Chrome's popup resize detection picks up the new width reliably.
   document.body.classList.toggle('tab-chat-active', name === 'chat');
+  void document.body.offsetWidth;
   if (name === 'search') {
     const q = $('manual-q') as HTMLInputElement;
     // Focus without scrolling the popup under the user's fingers.
