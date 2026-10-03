@@ -93,6 +93,10 @@ Manual track search across your metadata sources, with wishlist buttons on resul
 
 Your library, playable right in the extension. Unified music search across Artists, Albums, and Tracks — artist results start an artist radio, albums play straight through, tracks play immediately. No need to open the SoulSync web UI.
 
+<p align="center">
+  <img src="./docs/images/media-tab.png" alt="Media tab player" width="420">
+</p>
+
 ### Chat
 
 A mini version of the server chat — rooms, replies, emojis, file uploads. Same backend as the web UI's chat page.
@@ -114,6 +118,10 @@ A docked side panel that auto-opens when playback starts. Full player controls (
 - **Recently Played** — your server listening history; click to replay
 
 The panel also has its own library search at the top with the same Artists/Albums/Tracks sections as the Media tab.
+
+<p align="center">
+  <img src="./docs/images/player-panel.png" alt="Player panel with discovery shelves" width="420">
+</p>
 
 ---
 
