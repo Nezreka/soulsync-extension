@@ -1,0 +1,223 @@
+/* ── SoulSync Companion video player tab ────────────────────────
+   Same design language as the popup: quiet dark surfaces, one accent. */
+
+:root {
+  color-scheme: dark;
+  --bg: #08080d;
+  --surface: rgba(255, 255, 255, 0.045);
+  --surface-2: rgba(255, 255, 255, 0.08);
+  --border: rgba(255, 255, 255, 0.08);
+  --text: #f5f5f7;
+  --text-2: #c7c7cc;
+  --muted: #8e8e93;
+  --accent: linear-gradient(135deg, #ff2d78 0%, #a259ff 52%, #2db9ff 100%);
+  --pink: #ff2d78;
+  --blue: #2db9ff;
+  --green: #30d158;
+  --danger: #ff453a;
+  --warn: #ffd60a;
+  --radius: 16px;
+  --radius-s: 12px;
+}
+
+* { box-sizing: border-box; }
+
+html, body { margin: 0; padding: 0; }
+
+body {
+  min-height: 100vh;
+  background:
+    radial-gradient(130% 30% at 50% -10%, rgba(162, 89, 255, 0.14), transparent 62%),
+    var(--bg);
+  color: var(--text);
+  font: 14px/1.55 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui,
+    "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  display: flex;
+  justify-content: center;
+  padding: 28px 24px 48px;
+}
+
+:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+.muted { color: var(--muted); }
+
+.app {
+  width: 100%;
+  max-width: 880px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* ── header: title / subtitle above the video ─────────────────────── */
+.player-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.artwork {
+  width: 56px;
+  height: 56px;
+  border-radius: var(--radius-s);
+  object-fit: cover;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+.artwork.loaded { opacity: 1; }
+
+.head-meta { flex: 1; min-width: 0; }
+
+.title {
+  margin: 0;
+  font-size: 19px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.subtitle { margin: 2px 0 0; font-size: 13px; }
+
+/* ── ghost button (popup language) ────────────────────────────────── */
+.ghost {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-2);
+  border-radius: 999px;
+  padding: 7px 14px;
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  transition: background 0.15s ease, color 0.15s ease;
+  white-space: nowrap;
+}
+.ghost:hover { background: var(--surface-2); color: var(--text); }
+.ghost:active { transform: scale(0.97); }
+
+.icon-btn {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  border: none;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 13px;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.icon-btn:hover { background: var(--surface-2); color: var(--text); }
+
+/* ── warning strip (verdict "maybe") ──────────────────────────────── */
+.warn-strip {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  background: rgba(255, 214, 10, 0.07);
+  border: 1px solid rgba(255, 214, 10, 0.28);
+  border-radius: var(--radius-s);
+  padding: 12px 12px 12px 16px;
+}
+
+.warn-icon { color: var(--warn); font-size: 16px; line-height: 1.6; }
+.warn-body { flex: 1; min-width: 0; font-size: 13px; }
+.warn-body strong { display: block; margin-bottom: 2px; }
+
+.reasons {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  color: var(--text-2);
+}
+
+/* ── stage ────────────────────────────────────────────────────────── */
+.stage {
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: #000;
+  border: 1px solid var(--border);
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.55);
+}
+
+.stage video {
+  display: block;
+  width: 100%;
+  max-height: 72vh;
+  aspect-ratio: 16 / 9;
+  background: #000;
+}
+
+/* ── states: loading / empty / error ──────────────────────────────── */
+.state { display: flex; justify-content: center; padding: 24px 8px; }
+.state[hidden] { display: none; }
+/* Author display rules must not defeat the hidden attribute (lab finding:
+   empty warn strip + dead PiP button rendered on verdict pages). */
+.player-head[hidden], .ghost[hidden], .warn-strip[hidden] { display: none; }
+
+.state-card {
+  width: 100%;
+  max-width: 560px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 28px 30px;
+  text-align: center;
+}
+
+.state-card h2 {
+  margin: 0 0 8px;
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.state-card p { margin: 0; color: var(--text-2); font-size: 13.5px; }
+
+.state-card.error { border-color: rgba(255, 69, 58, 0.35); }
+.state-card.error h2 { color: var(--danger); }
+.state-card.error .reasons {
+  text-align: left;
+  display: inline-block;
+  margin-top: 12px;
+  max-width: 100%;
+}
+
+.spinner {
+  width: 26px;
+  height: 26px;
+  margin: 0 auto 14px;
+  border-radius: 50%;
+  border: 3px solid var(--surface-2);
+  border-top-color: var(--pink);
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.pip-note {
+  font-size: 12.5px;
+  text-align: center;
+}
+
+/* ── reduced motion ───────────────────────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  .spinner { animation: none; border-top-color: var(--surface-2); }
+  .ghost, .icon-btn, .artwork { transition: none; }
+}

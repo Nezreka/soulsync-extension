@@ -30,7 +30,8 @@
 
 - [Why Companion](#why-companion)
 - [At a glance](#at-a-glance)
-- [The popup](#the-popup) — Now Playing · Search · Activity
+- [The popup](#the-popup) — Now Playing · Media · Search · Chat · Activity
+- [The player panel](#the-player-panel) — docked side panel with discovery shelves
 - [Page badges](#page-badges)
 - [Save playlists](#save-playlists)
 - [Right-click text import](#right-click-text-import)
@@ -61,6 +62,9 @@ SoulSync already knows your library — what's in it, what's wishlisted, which a
 | **Playlist saving** | Spotify & Deezer — one click mirrors the playlist on your server |
 | **Release pages** | Bandcamp & Beatport — send the whole release as one job |
 | **Text import** | Paste `Artist - Title` lines, or right-click any text → Send to SoulSync |
+| **In-extension player** | Play your library from the Media tab — no need to open SoulSync |
+| **Player panel** | Docked side panel with Up Next queue and discovery shelves |
+| **Chat** | Mini version of the server chat, right in the popup |
 | **Browsers** | Chrome 109+ / Firefox 121+, one Manifest V3 codebase |
 
 ---
@@ -85,9 +89,31 @@ The header carries a **Badges** toggle — page badges on or off, right there, p
 
 Manual track search across your metadata sources, with wishlist buttons on results. Below it, **Text import**: paste lines of `Artist - Title`, hit **Parse**, review the checkboxes, and send them to your **Wishlist** or into a **Playlist**. Lines that don't parse are flagged, never silently dropped.
 
+### Media
+
+Your library, playable right in the extension. Unified music search across Artists, Albums, and Tracks — artist results start an artist radio, albums play straight through, tracks play immediately. No need to open the SoulSync web UI.
+
+### Chat
+
+A mini version of the server chat — rooms, replies, emojis, file uploads. Same backend as the web UI's chat page.
+
 ### Activity
 
 Server activity at the top (live sessions, play history, stats — the same data as the web UI's Server Activity drawer), plus the extension's own **Recent activity** feed: every wishlist, playlist import, and release send is recorded locally and survives popup closes.
+
+---
+
+## The player panel
+
+A docked side panel that auto-opens when playback starts. Full player controls (play/pause, prev/next, seek, volume, picture-in-picture for video), MediaSession integration (OS media keys, toolbar controller), and below it:
+
+- **Up Next** — the current queue, capped and scrollable, click any row to jump to it
+- **Similar Artists** — image cards; click to play that artist's music radio-style
+- **Playlists** — your mirrored playlists; click to play
+- **Recently Added** — newest albums in your library; click to play
+- **Recently Played** — your server listening history; click to replay
+
+The panel also has its own library search at the top with the same Artists/Albums/Tracks sections as the Media tab.
 
 ---
 

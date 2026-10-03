@@ -1,5 +1,6 @@
 import browser from 'webextension-polyfill';
 import type { ReleaseInfo, ServerConfig } from './types.js';
+import { mapLibraryTrack, type LibraryTrack } from './player-api.js';
 
 /**
  * SoulSync server client.
@@ -1018,6 +1019,39 @@ export async function getRecentlyAdded(cfg: ServerConfig, limit = 12): Promise<R
   });
 }
 
+export interface RecentTrack {
+  id: number;
+  title: string;
+  artist: string;
+  album: string;
+  filePath: string;
+  thumb: string;
+  playedAt: string;
+}
+
+/** GET /api/v1/library/recently-played — tracks from listening history. */
+export async function getRecentlyPlayed(cfg: ServerConfig, limit = 20): Promise<RecentTrack[]> {
+  const data = await apiFetch(
+    cfg,
+    `${V1}/library/recently-played?limit=${Math.min(100, Math.max(1, limit))}`,
+    { method: 'GET' },
+  );
+  const tracks = data.tracks;
+  if (!Array.isArray(tracks)) return [];
+  return tracks.map((it: unknown) => {
+    const o = it as Record<string, unknown>;
+    return {
+      id: typeof o.id === 'number' ? o.id : 0,
+      title: typeof o.title === 'string' ? o.title : 'Untitled',
+      artist: typeof o.artist_name === 'string' ? o.artist_name : '',
+      album: typeof o.album_title === 'string' ? o.album_title : '',
+      filePath: typeof o.file_path === 'string' ? o.file_path : '',
+      thumb: typeof o.thumb_url === 'string' ? o.thumb_url : '',
+      playedAt: typeof o.played_at === 'string' ? o.played_at : '',
+    };
+  });
+}
+
 export interface RecentVideo {
   id: number;
   title: string;
@@ -1025,6 +1059,39 @@ export interface RecentVideo {
   year: number | null;
   thumb: string;
   addedAt: string;
+}
+
+export interface Playlist {
+  id: number;
+  name: string;
+  trackCount: number;
+}
+
+/** GET /api/v1/library/playlists — curated playlists with track counts. */
+export async function getPlaylists(cfg: ServerConfig): Promise<Playlist[]> {
+  const data = await apiFetch(cfg, `${V1}/library/mirrored-playlists`, { method: 'GET' });
+  const playlists = data.playlists;
+  if (!Array.isArray(playlists)) return [];
+  return playlists.map((it: unknown) => {
+    const o = it as Record<string, unknown>;
+    return {
+      id: typeof o.id === 'number' ? o.id : 0,
+      name: typeof o.name === 'string' ? o.name : 'Untitled',
+      trackCount: typeof o.track_count === 'number' ? o.track_count : 0,
+    };
+  });
+}
+
+/** GET /api/v1/library/playlists/{id}/tracks — tracks in playlist order. */
+export async function getPlaylistTracks(cfg: ServerConfig, playlistId: number): Promise<LibraryTrack[]> {
+  const data = await apiFetch(
+    cfg,
+    `${V1}/library/mirrored-playlists/${playlistId}/tracks`,
+    { method: 'GET' },
+  );
+  const tracks = data.tracks;
+  if (!Array.isArray(tracks)) return [];
+  return tracks.map(mapLibraryTrack);
 }
 
 /** GET /api/v1/video/library?sort=added — newest movies/shows to land. */
@@ -1709,3 +1776,8 @@ export function badgesEnabledFromStored(stored: unknown): boolean {
   }
   return true;
 }
+
+/* ── player (extension playback) ── */
+// Player server-API layer (library listing + stream URL builders) lives in
+// its own module; re-exported here so callers keep one import surface.
+export * from './player-api.js';

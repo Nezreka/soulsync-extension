@@ -1,4 +1,7 @@
+/// <reference types="chrome" />
 import browser from 'webextension-polyfill';
+import { startAudioHost } from '../player/host.js';
+import { libraryAudioUrl } from '../shared/player-api.js';
 import type { BadgeCandidate, VideoSearchHit } from '../shared/api.js';
 import type { ServerConfig } from '../shared/types.js';
 import { deezerAlbumTracks } from '../shared/provider_ids.js';
@@ -551,3 +554,269 @@ async function handleVideoBadgeAction(m: VideoBadgeAction): Promise<Record<strin
   }
   return false;
 });
+
+/* ── In-extension player: audio host wiring (docs/player-spec.md §4) ── */
+
+// The runtime `chrome` global is untyped by the tsconfig ("types": []), so
+// read it off globalThis with the @types/chrome namespace for its type.
+// (Kept off the bare `chrome` name to avoid clashing with the
+// webextension-polyfill `browser` import above.)
+const extChrome: typeof chrome | undefined =
+  (globalThis as unknown as { chrome?: typeof chrome }).chrome;
+
+// Chrome exposes chrome.offscreen; Firefox does not. The packaged firefox
+// build runs this same bundle as a real background page with a DOM, so it
+// hosts the <audio> element directly instead of using an offscreen document.
+const HAS_OFFSCREEN: boolean =
+  typeof extChrome !== 'undefined' && typeof extChrome.offscreen !== 'undefined';
+
+if (!HAS_OFFSCREEN) {
+  // Firefox background page: start the audio host in this context. Defer
+  // until the DOM is ready if it isn't yet (document.createElement needs it).
+  const startHost = (): void => {
+    startAudioHost({ resolveAudioUrl: libraryAudioUrl, getConfig });
+  };
+  if (typeof document !== 'undefined' && document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', startHost, { once: true });
+  } else if (typeof document !== 'undefined') {
+    startHost();
+  }
+}
+
+/**
+ * Defensively validate a pending-video entry: needs videoKd 'm'|'t', a
+ * finite videoId, and a non-empty title. Returns an error string, or null
+ * when the entry is usable.
+ */
+function validateVideoEntry(entry: unknown): string | null {
+  if (!entry || typeof entry !== 'object') return 'missing video entry';
+  const e = entry as Record<string, unknown>;
+  if (e.videoKd !== 'm' && e.videoKd !== 't') return 'invalid videoKd';
+  if (typeof e.videoId !== 'number' || !Number.isFinite(e.videoId)) return 'invalid videoId';
+  if (typeof e.title !== 'string' || !e.title.trim()) return 'missing title';
+  return null;
+}
+
+// ── In-extension player: the service worker owns the protocol ──
+//
+// Chrome does not reliably deliver runtime messages from extension views
+// (popup, player tab) straight to the offscreen document, so the service
+// worker — reachable from every context — verifies the audio host is up
+// (handshake) and relays player:* requests to it. On Firefox the host runs
+// in this same context, so the relay is skipped and the host's own listener
+// answers directly. `player:openVideo` is handled here (needs tabs/storage).
+//
+// Playing indicator: the host broadcasts `player:stateChanged` on every
+// status transition. The badge lives here (not in the host) because the
+// Chrome offscreen document can't reliably touch browser.action.
+function updateToolbarPlayingBadge(playing: boolean): void {
+  try {
+    if (playing) {
+      void browser.action.setBadgeBackgroundColor({ color: '#22c55e' });
+      void browser.action.setBadgeText({ text: '♪' });
+    } else {
+      void browser.action.setBadgeText({ text: '' });
+    }
+  } catch {
+    /* badge API unavailable */
+  }
+}
+
+browser.runtime.onMessage.addListener((message: unknown) => {
+  const m = message as { type?: string; relayed?: boolean; entry?: unknown } | null;
+  if (m?.type === 'player:stateChanged') {
+    const snap = (m as { snapshot?: { status?: string } }).snapshot;
+    updateToolbarPlayingBadge(snap?.status === 'playing');
+    return false;
+  }
+  if (m?.type === 'player:openVideo') {
+    return (async () => {
+      const err = validateVideoEntry(m.entry);
+      if (err) return { ok: false, error: err };
+      await browser.storage.session.set({ pendingVideoEntry: m.entry });
+      await browser.tabs.create({ url: browser.runtime.getURL('player-tab/player.html') });
+      return { ok: true };
+    })();
+  }
+  if (m?.type === 'player:ensureHost') {
+    return ensureAudioHost();
+  }
+  // Config lookup for the offscreen host: offscreen documents only get
+  // chrome.runtime (no chrome.storage), so the worker — which has storage —
+  // answers on its behalf. Handled before the relay branch below.
+  if (m?.type === 'player:getConfig') {
+    return (async () => {
+      try {
+        return (await getConfig()) ?? null;
+      } catch {
+        return null;
+      }
+    })();
+  }
+  // Relay player requests to the audio host. `relayed` marks our own
+  // forwards so a context that hears its own message can't loop; the
+  // broadcast `player:stateChanged` is fire-and-forget and never relayed.
+  if (
+    typeof m?.type === 'string' &&
+    m.type.startsWith('player:') &&
+    m.type !== 'player:stateChanged' &&
+    !m.relayed
+  ) {
+    // Firefox: the host lives in this context — its own listener answers.
+    if (!HAS_OFFSCREEN || !extChrome) return false;
+    return (async () => {
+      const ready = await ensureAudioHost();
+      if (!ready.ok) throw new Error(ready.error);
+      try {
+        return await browser.runtime.sendMessage({
+          ...(message as Record<string, unknown>),
+          relayed: true,
+        });
+      } catch {
+        // The host may have died since verification — drop the cached
+        // verdict so the next call re-verifies (and recreates) instead of
+        // failing quietly for the rest of the TTL. The popup's retry loop
+        // re-runs the handshake.
+        hostVerifiedUntil = 0;
+        return undefined;
+      }
+    })();
+  }
+  return false;
+});
+
+type AudioHostReady = { ok: true } | { ok: false; error: string };
+
+// A successful verification stays trusted for a while: the popup polls
+// player state every second, and re-running the full handshake (plus its
+// logging) on every tick is pure noise. The relay clears this the moment a
+// forward actually fails, so a dead host is re-verified on the next call.
+let hostVerifiedUntil = 0;
+const HOST_VERIFY_TTL_MS = 30_000;
+
+// Serialized: concurrent ensureHost callers share one handshake instead of
+// racing createDocument/closeDocument against each other.
+let audioHandshake: Promise<AudioHostReady> | null = null;
+
+function ensureAudioHost(): Promise<AudioHostReady> {
+  if (Date.now() < hostVerifiedUntil) return Promise.resolve({ ok: true });
+  if (!audioHandshake) {
+    audioHandshake = runAudioHandshake()
+      .then((res) => {
+        if (res.ok) hostVerifiedUntil = Date.now() + HOST_VERIFY_TTL_MS;
+        return res;
+      })
+      .finally(() => {
+        audioHandshake = null;
+      });
+  }
+  return audioHandshake;
+}
+
+function errMsg(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+async function runAudioHandshake(): Promise<AudioHostReady> {
+  const tag = '[soulsync-player]';
+  // No offscreen API (Firefox, or a Chromium without it): the host runs in
+  // the background page — but only if this context has a DOM. A service
+  // worker without chrome.offscreen cannot host audio at all: say so
+  // plainly instead of reporting ready with no host behind it.
+  if (!HAS_OFFSCREEN || !extChrome) {
+    console.debug(
+      tag,
+      `ensureHost: no offscreen API (chrome=${typeof extChrome}, offscreen=${
+        typeof extChrome?.offscreen
+      }, document=${typeof document})`
+    );
+    if (typeof document !== 'undefined') return { ok: true }; // Firefox background page: host runs here
+    return {
+      ok: false,
+      error: 'audio unavailable: this browser does not provide chrome.offscreen',
+    };
+  }
+  const chromeApi = extChrome;
+  // Absolute URL on purpose: a relative 'offscreen/player.html' risks
+  // resolving against the service worker's own directory instead of the
+  // extension root, which creates a document whose page never loads — and
+  // hasDocument() still returns true for it, so every later call silently
+  // talks to a host that will never answer.
+  const docUrl = chromeApi.runtime.getURL('offscreen/player.html');
+  let hadDocument = false;
+  try {
+    hadDocument = await chromeApi.offscreen.hasDocument();
+    if (!hadDocument) {
+      console.debug(tag, 'ensureHost: creating offscreen document');
+      await chromeApi.offscreen.createDocument({
+        url: docUrl,
+        // The Reason enum is types-only (no runtime value) — cast the literal.
+        reasons: ['AUDIO_PLAYBACK' as chrome.offscreen.Reason],
+        justification: 'Play SoulSync audio in the background',
+      });
+      console.debug(tag, 'ensureHost: offscreen document created');
+    }
+    // (No "already exists" / "answered ping" logging on the happy path —
+    // the popup polls every second and this would flood the console.)
+  } catch (e) {
+    console.error(tag, 'ensureHost: createDocument failed', e);
+    return { ok: false, error: `offscreen document failed: ${errMsg(e)}` };
+  }
+  // Verified handshake: don't report ready until the audio host actually
+  // answers a ping.
+  if (await pingPlayerHost(6000)) {
+    return { ok: true };
+  }
+  // A document we just created may still have been loading — never destroy
+  // it; only a pre-existing silent document gets closed and recreated once,
+  // so a bad document left behind by an earlier build heals itself.
+  if (!hadDocument) {
+    console.error(tag, 'ensureHost: fresh document silent after 6s');
+    return { ok: false, error: 'audio host failed to start (offscreen document unresponsive)' };
+  }
+  console.warn(tag, 'ensureHost: stale document silent — closing and recreating');
+  try {
+    await chromeApi.offscreen.closeDocument();
+  } catch {
+    /* already gone */
+  }
+  // Give Chrome a beat to tear the document down before recreating.
+  await new Promise((r) => setTimeout(r, 500));
+  try {
+    await chromeApi.offscreen.createDocument({
+      url: docUrl,
+      reasons: ['AUDIO_PLAYBACK' as chrome.offscreen.Reason],
+      justification: 'Play SoulSync audio in the background',
+    });
+  } catch (e) {
+    console.error(tag, 'ensureHost: recreate failed', e);
+    return { ok: false, error: `offscreen recreate failed: ${errMsg(e)}` };
+  }
+  if (await pingPlayerHost(8000)) {
+    console.debug(tag, 'ensureHost: recreated host answered ping');
+    return { ok: true };
+  }
+  console.error(tag, 'ensureHost: audio host silent after recreate');
+  return { ok: false, error: 'audio host silent after offscreen recreate' };
+}
+
+/**
+ * True once the audio host answers `player:ping`. Marked relayed so this
+ * context's own relay branch can't catch it and loop.
+ */
+async function pingPlayerHost(timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const res = (await browser.runtime.sendMessage({ type: 'player:ping', relayed: true })) as
+        | { ok?: unknown }
+        | undefined;
+      if (res && res.ok === true) return true;
+    } catch {
+      /* host not up yet */
+    }
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  return false;
+}
+

@@ -1,0 +1,41 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>SoulSync Player</title>
+  <link rel="stylesheet" href="./player.css" />
+</head>
+<body>
+  <div id="app" class="app">
+    <header id="player-head" class="player-head" hidden>
+      <img id="artwork" class="artwork" alt="" hidden />
+      <div class="head-meta">
+        <h1 id="title" class="title"></h1>
+        <p id="subtitle" class="subtitle muted"></p>
+      </div>
+      <button id="pip-btn" class="ghost pip-btn" hidden title="Play in Picture-in-Picture">
+        <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
+          <rect x="1" y="2.5" width="14" height="11" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.5"/>
+          <rect x="7.5" y="7" width="5" height="4" rx="1" fill="currentColor"/>
+        </svg>
+        <span>Picture-in-picture</span>
+      </button>
+    </header>
+
+    <div id="warn" class="warn-strip" hidden role="status">
+      <span class="warn-icon" aria-hidden="true">⚠</span>
+      <div class="warn-body">
+        <strong>Heads up</strong>
+        <ul id="warn-reasons" class="reasons"></ul>
+      </div>
+      <button id="warn-close" class="icon-btn" aria-label="Dismiss warning">✕</button>
+    </div>
+
+    <div id="stage" class="stage" hidden></div>
+
+    <div id="state" class="state" role="status"></div>
+    <div id="pip-note" class="pip-note muted" hidden></div>
+  </div>
+  <script src="./player.js"></script>
+</body>
+</html>

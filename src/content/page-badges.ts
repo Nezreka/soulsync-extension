@@ -9,7 +9,17 @@ import {
   splitArtists,
   trackFromVideoTitle,
 } from '../shared/youtube.js';
-import { BADGES_ENABLED_KEY, badgesEnabledFromStored, normName } from '../shared/api.js';
+import {
+  BADGES_ENABLED_KEY,
+  badgesEnabledFromStored,
+  normName,
+  getConfig,
+  searchLibraryTracks,
+  toQueueEntry,
+  isUnplayableAudio,
+  type LibraryTrack,
+} from '../shared/api.js';
+import { sendToPlayer } from '../player/messaging.js';
 
 /**
  * Page badges: tiny library-status pills next to artist/album names.
@@ -1246,6 +1256,14 @@ function mountBadge(c: Candidate): HTMLElement {
       quiet(onWatchingPillClick(host));
       return;
     }
+    // "In library" track pill: click-to-play. Resolve the badge's track
+    // identity to a library track with a file path and hand it to the
+    // player. (Album "in library" pills keep opening the popover — album
+    // playback is not part of this workstream.)
+    if (r && r.visual === 'in' && r.candidate.kind === 'track') {
+      quiet(onPlayTrackPillClick(host));
+      return;
+    }
     // Wishlist pill ("+ Wishlist track/album"): ONE CLICK adds directly —
     // no popover, no modal. Once wishlisted ("✓ Wishlisted") the pill is
     // not clickable: no re-add, no remove (Broque: no wishlist removal in
@@ -1301,6 +1319,67 @@ async function onWishlistPillClick(host: HTMLElement): Promise<void> {
   }
   actedKeys.add(badgeKeyFor(c));
   setPillState(host, 'acted');
+}
+
+/**
+ * Click-to-play from an "In library" track pill.
+ *
+ * The badge's own library lookup only returned a boolean (the background's
+ * SOULSYNC_BADGE_LOOKUP answers {true,false,null} — it never carried a file
+ * path), so this re-searches the library by the badge's title+artist and
+ * takes the best playable hit: exact normalized title match first, then the
+ * server's top result. WMA copies are skipped — browsers can't decode them.
+ * Busy affordance (the file's .ssb-busy) while resolving; on failure the
+ * pill reverts and the popover opens with the honest reason, via the file's
+ * existing showError mechanism. Never fakes an identity: a track candidate
+ * always carries name+artist (extractors skip rows missing either).
+ */
+async function onPlayTrackPillClick(host: HTMLElement): Promise<void> {
+  const rec = badges.get(host);
+  if (!rec || rec.candidate.kind !== 'track' || rec.visual !== 'in') return;
+  const { pill } = rec;
+  if (pill.classList.contains('ssb-busy')) return; // resolve already in flight
+  const c = rec.candidate;
+  pill.classList.add('ssb-busy');
+  pill.title = `Finding ${c.name} in your library…`;
+  pill.setAttribute('aria-label', `${c.name}: finding it in your library…`);
+  const restore = (): void => {
+    if (badges.get(host) !== rec) return;
+    pill.classList.remove('ssb-busy');
+    setPillState(host, 'in');
+  };
+  try {
+    const cfg = await getConfig();
+    if (!cfg) throw new Error('No SoulSync server is connected in the extension.');
+    const hits = await searchLibraryTracks(cfg, {
+      title: c.name,
+      artist: c.artist ?? '',
+      limit: 10,
+    });
+    const withPath = hits.filter((h) => h.filePath);
+    const playable = withPath.filter((h) => !isUnplayableAudio(h.filePath));
+    const wmaSkipped = playable.length === 0 && withPath.length > 0;
+    const want = normName(c.name);
+    const track: LibraryTrack | undefined =
+      playable.find((h) => normName(h.title) === want) ?? playable[0];
+    if (!track) {
+      throw new Error(
+        wmaSkipped
+          ? `Only WMA ${withPath.length === 1 ? 'copy' : 'copies'} of "${c.name}" found — browsers can't play WMA.`
+          : `Couldn't find "${c.name}" in your library just now.`,
+      );
+    }
+    await sendToPlayer({ type: 'player:playNow', entry: toQueueEntry(track) });
+  } catch (e) {
+    restore();
+    // The file's existing failure mechanism: open the popover and show the
+    // reason in its error strip (same as the wishlist flow).
+    togglePopover(host);
+    const r2 = badges.get(host);
+    if (r2?.pop) showError(r2, e instanceof Error ? e.message : 'Could not start playback.');
+    return;
+  }
+  restore();
 }
 
 /** Save-playlist pill click: one click runs the full flow in the
@@ -1476,10 +1555,15 @@ function setPillState(host: HTMLElement, visual: Exclude<PillVisual, 'loading'>)
   } else if (visual === 'in') {
     // Album pills name their subject ("Album in library"); track pills are
     // terse ("In library") — the popover title already names the track.
+    // Track pills click-to-play; album pills open the popover (no album
+    // playback yet) — the tooltip must promise what the click actually does.
     const label = candidate.kind === 'album' ? 'Album in library' : 'In library';
+    const clickHint =
+      candidate.kind === 'track' ? 'Click to play.' : 'Click for details.';
+    const ariaHint = candidate.kind === 'track' ? 'Click to play.' : 'Show details.';
     pill.className = `ssb-pill ssb-in${miniCls}`;
-    pill.title = `${name} — in your SoulSync library. Click for details.`;
-    pill.setAttribute('aria-label', `${name}: in your SoulSync library. Show details.`);
+    pill.title = `${name} — in your SoulSync library. ${clickHint}`;
+    pill.setAttribute('aria-label', `${name}: in your SoulSync library. ${ariaHint}`);
     pill.innerHTML = `<span aria-hidden="true">✓</span><span>${label}</span>`;
   } else if (visual === 'acted') {
     if (candidate.kind === 'artist') {

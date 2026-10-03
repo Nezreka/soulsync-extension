@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>SoulSync Companion — audio host</title>
+  </head>
+  <body>
+    <!-- Offscreen document (Chrome only): hosts the single <audio> element
+         for the in-extension player. Created lazily by the service worker
+         via chrome.offscreen.createDocument({reasons:['AUDIO_PLAYBACK']}).
+         Not a UI page — nothing is rendered. -->
+    <script src="player.js"></script>
+  </body>
+</html>

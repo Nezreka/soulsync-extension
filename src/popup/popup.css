@@ -63,6 +63,7 @@ body > main > .tab-panel::-webkit-scrollbar-thumb {
   border-radius: 999px;
 }
 body > #status { flex: none; }
+body {
   color: var(--text);
   font: 13px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui,
     "Segoe UI", Roboto, sans-serif;
@@ -627,6 +628,27 @@ textarea:focus, input:focus, select:focus {
 }
 .tab-btn:active { transform: none; }
 .tab-panel[hidden] { display: none; }
+/* Playing indicator: a small pulsing dot on a tab while audio plays. */
+.tab-btn { position: relative; }
+.tab-btn.tab-playing::after {
+  content: '';
+  position: absolute;
+  top: 7px;
+  right: 10px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #22c55e;
+  box-shadow: 0 0 6px rgba(34, 197, 94, 0.9);
+  animation: tab-playing-pulse 1.6s ease-in-out infinite;
+}
+@keyframes tab-playing-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.8); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tab-btn.tab-playing::after { animation: none; }
+}
 
 /* ── manual search ──────────────────────────────────────────────── */
 .search-row { display: flex; gap: 8px; }
@@ -883,4 +905,366 @@ textarea:focus, input:focus, select:focus {
   .sact-list.sact-enter > .sact-card, .sact-eq i { animation: none; }
   .sact-prog-fill { transition: none; }
   .sact-st-buffering .sact-prog-fill { animation: none; }
+}
+
+/* ── player remote (Live tab) ────────────────────────────── */
+.pr-head-right { display: inline-flex; align-items: center; gap: 8px; }
+/* Pop-out: quiet icon button that opens the draggable mini player window. */
+.pr-popout {
+  font-size: 14px;
+  line-height: 1;
+  padding: 4px 8px;
+  border-radius: var(--radius-s);
+}
+.pr-now {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  margin-top: 10px;
+}
+/* Fixed-aspect artwork tile: always 64×64 so nothing jumps when the image
+   loads, fails, or is absent. The image fades in over the quiet tile. */
+.pr-art-wrap {
+  width: 64px;
+  height: 64px;
+  flex: none;
+  border-radius: var(--radius-s);
+  overflow: hidden;
+  background: linear-gradient(135deg, #2b2b38 0%, #1a1a24 55%, #241a2e 100%);
+  border: 1px solid var(--border);
+}
+.pr-art {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+.pr-art.loaded { opacity: 1; }
+.pr-meta { flex: 1; min-width: 0; }
+.pr-title {
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+#pr-sub {
+  font-size: 12.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+#pr-state { margin-top: 2px; }
+
+.pr-transport {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: center;
+  margin-top: 12px;
+}
+/* Quiet circular transport buttons; the toggle keeps the primary gradient. */
+.pr-tbtn {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  padding: 0;
+}
+.pr-tbtn svg { display: block; }
+.pr-tbtn-quiet {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text-2);
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease,
+    transform 0.1s ease;
+}
+.pr-tbtn-quiet:hover:not(:disabled) {
+  background: var(--surface-2);
+  border-color: rgba(255, 255, 255, 0.14);
+  color: var(--text);
+}
+.pr-tbtn-quiet:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+button#pr-toggle {
+  width: 54px;
+  height: 54px;
+  font-size: 19px;
+  border-radius: 50%;
+  padding: 0;
+}
+button.ghost:disabled, button.secondary:disabled, button.primary:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.pr-seekrow {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: 10px;
+}
+/* Custom sliders (webkit + moz): thin quiet track, filled progress, soft
+   round thumb. The --fill var is painted from the poll loop. */
+.pr-seekrow input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  flex: 1;
+  min-width: 0;
+  height: 20px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  --fill: 0%;
+  --track: rgba(255, 255, 255, 0.14);
+}
+.pr-seekrow input[type="range"]::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--pink) var(--fill), var(--track) var(--fill));
+}
+.pr-seekrow input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  margin-top: -4px;
+  border: none;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 5px rgba(0, 0, 0, 0.55);
+  transition: transform 0.12s ease;
+}
+.pr-seekrow input[type="range"]:hover::-webkit-slider-thumb { transform: scale(1.2); }
+.pr-seekrow input[type="range"]:active::-webkit-slider-thumb { transform: scale(1.1); }
+.pr-seekrow input[type="range"]::-moz-range-track {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--track);
+}
+.pr-seekrow input[type="range"]::-moz-range-progress {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--pink);
+}
+.pr-seekrow input[type="range"]::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border: none;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 5px rgba(0, 0, 0, 0.55);
+  transition: transform 0.12s ease;
+}
+.pr-seekrow input[type="range"]:hover::-moz-range-thumb { transform: scale(1.2); }
+.pr-seekrow input[type="range"].pr-vol { flex: 0 0 76px; }
+.pr-seekrow input[type="range"].pr-vol::-webkit-slider-thumb {
+  width: 10px;
+  height: 10px;
+  margin-top: -3px;
+}
+.pr-seekrow input[type="range"].pr-vol::-moz-range-thumb {
+  width: 10px;
+  height: 10px;
+}
+.pr-seekrow input[type="range"]:disabled { opacity: 0.35; cursor: default; }
+.pr-seekrow input[type="range"]:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 4px;
+  border-radius: 999px;
+}
+.pr-time { font-variant-numeric: tabular-nums; flex: none; }
+
+.pr-error {
+  margin-top: 10px;
+  font-size: 12.5px;
+  color: var(--danger);
+  background: rgba(255, 69, 58, 0.08);
+  border: 1px solid rgba(255, 69, 58, 0.25);
+  border-radius: var(--radius-s);
+  padding: 8px 10px;
+}
+#pr-empty { margin-top: 10px; font-size: 12.5px; }
+
+#pr-queue {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 280px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
+}
+#pr-queue::-webkit-scrollbar {
+  width: 6px;
+}
+#pr-queue::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 3px;
+}
+#pr-queue::-webkit-scrollbar-track {
+  background: transparent;
+}
+.pr-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+  padding: 7px 8px 7px 10px;
+  transition: border-color 0.15s ease;
+}
+.pr-row:hover { border-color: rgba(255, 255, 255, 0.14); }
+.pr-row-mid { flex: 1; min-width: 0; cursor: pointer; border-radius: 6px; }
+.pr-row-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pr-row-sub {
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pr-row-current { border-color: rgba(255, 45, 120, 0.45); }
+.pr-mini {
+  flex: none;
+  font-size: 12px;
+  padding: 5px 8px;
+  border-radius: 999px;
+}
+
+#player-remote .row { margin-top: 10px; }
+#player-remote .row input {
+  flex: 1;
+  min-width: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pr-tbtn, .pr-tbtn-quiet, .pr-mini, .pr-art, .pr-row,
+  .pr-seekrow input[type="range"],
+  .pr-seekrow input[type="range"]::-webkit-slider-thumb,
+  .pr-seekrow input[type="range"]::-moz-range-thumb { transition: none; }
+}
+
+/* ── media tab (library search + playback) ─────────────────────── */
+
+.kind-switch {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 10px;
+  padding: 4px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  width: max-content;
+}
+.kind-btn {
+  background: none;
+  border: 0;
+  cursor: pointer;
+  padding: 6px 14px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--muted);
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.kind-btn:hover { color: var(--text); }
+.kind-btn.kind-active {
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+}
+
+#media-card .row { margin-top: 2px; }
+#media-card .row input {
+  flex: 1;
+  min-width: 0;
+}
+
+.media-state {
+  margin-top: 10px;
+  font-size: 12px;
+  min-height: 1.2em;
+}
+
+#media-results {
+  margin: 10px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.media-section-header {
+  list-style: none;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  padding: 8px 4px 2px;
+  margin-top: 4px;
+}
+.media-section-header:first-child {
+  margin-top: 0;
+  padding-top: 2px;
+}
+.media-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+  padding: 7px 8px 7px 7px;
+}
+.media-art {
+  width: 44px;
+  height: 44px;
+  border-radius: 9px;
+  object-fit: cover;
+  flex-shrink: 0;
+  background: var(--surface-2);
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+.media-art.loaded { opacity: 1; }
+.media-art-ph {
+  background: linear-gradient(135deg, #2b2b38 0%, #1a1a24 55%, #241a2e 100%);
+  opacity: 1;
+}
+.media-mid { flex: 1; min-width: 0; }
+.media-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.media-sub {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.media-actions { display: flex; gap: 4px; flex: none; align-items: center; }
+
+@media (prefers-reduced-motion: reduce) {
+  .kind-btn, .media-art { transition: none; }
 }

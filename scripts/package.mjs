@@ -26,17 +26,34 @@ async function zipDir(srcDir, zipPath) {
   console.log(`packaged -> ${zipPath}`);
 }
 
-// Chrome: dist/ as-is (service_worker background).
-await zipDir(distDir, join(root, `${pkg.name}-${pkg.version}-chrome.zip`));
+// Chrome: dist/ plus the side panel entries for the mini player.
+const chDir = await mkdtemp(join(tmpdir(), 'soulsync-ch-'));
+await cp(distDir, chDir, { recursive: true });
+const chManifest = JSON.parse(await readFile(join(chDir, 'manifest.json'), 'utf8'));
+if (!chManifest.permissions.includes('sidePanel')) chManifest.permissions.push('sidePanel');
+chManifest.side_panel = { default_path: 'mini-player/mini.html' };
+await writeFile(join(chDir, 'manifest.json'), JSON.stringify(chManifest, null, 2) + '\n');
+await zipDir(chDir, join(root, `${pkg.name}-${pkg.version}-chrome.zip`));
+await rm(chDir, { recursive: true, force: true });
 
 // Firefox: same files, but the manifest's background becomes the scripts
-// event-page form (Firefox ignores service_worker; Chrome rejects scripts).
+// event-page form (Firefox ignores service_worker; Chrome rejects scripts),
+// and the mini player becomes a real browser sidebar.
 const fxDir = await mkdtemp(join(tmpdir(), 'soulsync-fx-'));
 await cp(distDir, fxDir, { recursive: true });
 const manifest = JSON.parse(await readFile(join(fxDir, 'manifest.json'), 'utf8'));
 manifest.background = {
   scripts: ['background/service-worker.js'],
   type: 'module',
+};
+manifest.sidebar_action = {
+  default_panel: 'mini-player/mini.html',
+  default_title: 'SoulSync mini player',
+  default_icon: {
+    16: 'icons/icon-16.png',
+    48: 'icons/icon-48.png',
+    128: 'icons/icon-128.png',
+  },
 };
 await writeFile(join(fxDir, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
 await zipDir(fxDir, join(root, `${pkg.name}-${pkg.version}-firefox.zip`));

@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>SoulSync Mini Player</title>
+  <link rel="stylesheet" href="mini.css" />
+</head>
+<body>
+  <main id="mini">
+    <div class="mini-topbar">
+      <span class="mini-brand"><img class="mini-logo" src="../icons/logo.png" alt="" />SoulSync</span>
+    </div>
+    <div id="m-audio">
+      <div class="mini-art-wrap"><img id="m-art" class="mini-art" alt="" /></div>
+      <div id="m-title" class="mini-title">Nothing queued</div>
+      <div id="m-sub" class="mini-sub"></div>
+      <div id="m-state" class="mini-state"></div>
+      <div class="mini-transport">
+        <button id="m-prev" class="mini-tbtn" title="Previous">⏮</button>
+        <button id="m-toggle" class="mini-tbtn mini-tbtn-primary" title="Play / pause">▶</button>
+        <button id="m-next" class="mini-tbtn" title="Next">⏭</button>
+      </div>
+      <div class="mini-seekrow">
+        <span id="m-pos" class="mini-time">0:00</span>
+        <input id="m-seek" type="range" min="0" max="1" value="0" step="1" aria-label="Seek" />
+        <span id="m-dur" class="mini-time">0:00</span>
+      </div>
+      <div class="mini-volrow">
+        <span class="mini-vol-ico" aria-hidden="true">🔊</span>
+        <input id="m-vol" type="range" min="0" max="100" value="100" aria-label="Volume" />
+      </div>
+    </div>
+    <section id="m-video" class="mini-video" hidden>
+      <div id="m-video-title" class="mini-title"></div>
+      <div id="m-video-sub" class="mini-sub"></div>
+      <div id="m-video-stage" class="mini-video-stage"></div>
+      <div id="m-video-error" class="mini-verror" hidden></div>
+      <div class="mini-video-row">
+        <button id="m-pip" class="mini-tbtn" title="Picture in picture">⛶</button>
+      </div>
+      <div id="m-video-warn" class="mini-vwarn" hidden></div>
+    </section>
+    <div id="m-error" class="mini-error" hidden></div>
+    <section id="m-queue" class="mini-queue">
+      <h3 class="disco-h">Up next</h3>
+      <div id="m-queue-list" class="disco-songs"></div>
+    </section>
+    <section id="m-disco" class="mini-disco">
+      <div class="disco-block" id="m-search-block">
+        <div class="disco-search-row">
+          <input id="m-search" class="disco-search" type="search" placeholder="Search your library…" autocomplete="off" />
+        </div>
+        <div id="m-search-results" class="disco-search-results" hidden></div>
+      </div>
+      <div class="disco-block" id="m-sim-artists-block" hidden>
+        <h3 class="disco-h">Similar artists</h3>
+        <div id="m-sim-artists" class="disco-cards"></div>
+      </div>
+      <div class="disco-block">
+        <h3 class="disco-h">Playlists</h3>
+        <div id="m-playlists" class="disco-cards"></div>
+      </div>
+      <div class="disco-block">
+        <h3 class="disco-h">Recently added</h3>
+        <div id="m-recent" class="disco-cards"></div>
+      </div>
+      <div class="disco-block">
+        <h3 class="disco-h">Recently played</h3>
+        <div id="m-recent-played" class="disco-cards"></div>
+      </div>
+      <div id="m-disco-note" class="disco-note" hidden></div>
+    </section>
+    <div id="m-hint" class="mini-hint" hidden>Connect your SoulSync server in the extension options to play.</div>
+  </main>
+  <script src="mini.js"></script>
+</body>
+</html>

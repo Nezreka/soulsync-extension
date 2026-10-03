@@ -1,5 +1,6 @@
 import browser from 'webextension-polyfill';
 import { BADGES_ENABLED_KEY, badgesEnabledFromStored } from '../shared/api.js';
+import type { OpenVideoResponse, PendingVideoEntry } from '../player/types.js';
 import badgeCssText from './page-badges.css';
 
 /**
@@ -123,6 +124,56 @@ function extractCandidate(provider: VideoProvider): VideoCandidate | undefined {
 
 type VideoPillState = 'loading' | 'in-library' | 'on-wishlist' | 'addable' | 'unknown';
 
+/**
+ * Click-to-play for "In library" video badges: queue the entry for the
+ * player tab, then open it. The tab itself calls /watch/playable and shows
+ * the honest verdict — this only hands it the tmdb identity the badge
+ * already holds. Routed through the background (player:openVideo) because
+ * content scripts have no browser.storage.session or browser.tabs API on
+ * Firefox. Brief busy affordance ("⋯"); on failure the badge restores and
+ * names the problem in its title. Callers only wire this up when
+ * candidate.tmdbId is known — never fakes an identity.
+ */
+async function playVideoEntry(
+  button: HTMLButtonElement,
+  candidate: VideoCandidate,
+): Promise<void> {
+  const tmdbId = candidate.tmdbId;
+  if (tmdbId === undefined || tmdbId <= 0 || button.disabled) return;
+  button.disabled = true;
+  const prevText = button.textContent;
+  const prevTitle = button.title;
+  button.textContent = '⋯';
+  button.title = `Opening ${candidate.title} in the player…`;
+  try {
+    const entry: PendingVideoEntry = {
+      videoKd: candidate.episode || candidate.kind === 'show' ? 't' : 'm',
+      videoId: tmdbId,
+      title: candidate.title,
+    };
+    if (candidate.episode) {
+      entry.season = candidate.episode.season;
+      entry.episode = candidate.episode.episode;
+    }
+    // {ok: false} surfaces through the honest-failure path below (the
+    // background validates the entry and opens the tab).
+    const res = (await browser.runtime.sendMessage({
+      type: 'player:openVideo',
+      entry,
+    })) as OpenVideoResponse | undefined;
+    if (!res?.ok) throw new Error(res?.error || 'could not queue the video');
+  } catch {
+    // Honest failure: restore the badge and say what went wrong.
+    button.textContent = prevText;
+    button.title = `${candidate.title} — couldn't open the player.`;
+    button.disabled = false;
+    return;
+  }
+  button.textContent = prevText;
+  button.title = prevTitle;
+  button.disabled = false;
+}
+
 function pillFor(
   candidate: VideoCandidate,
   state: VideoPillState,
@@ -147,9 +198,24 @@ function pillFor(
     pill.innerHTML = '<span class="ssb-dot"></span>';
   } else if (state === 'in-library') {
     pill.className = 'ssb-pill ssb-in';
-    pill.title = `${candidate.title} — in your SoulSync library.`;
-    pill.setAttribute('aria-label', `${candidate.title}: in your SoulSync library.`);
+    // Only TMDB pages carry a tmdbId — without it there's no identity to
+    // play, so the pill stays unclickable (never fake one).
+    const canPlay = typeof candidate.tmdbId === 'number' && candidate.tmdbId > 0;
+    pill.title = canPlay
+      ? `${candidate.title} — in your SoulSync library. Click to play.`
+      : `${candidate.title} — in your SoulSync library.`;
+    pill.setAttribute(
+      'aria-label',
+      `${candidate.title}: in your SoulSync library.${canPlay ? ' Click to play.' : ''}`,
+    );
     pill.innerHTML = '<span aria-hidden="true">✓</span><span>In library</span>';
+    if (canPlay) {
+      pill.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        void playVideoEntry(pill, candidate);
+      });
+    }
   } else if (state === 'on-wishlist') {
     pill.className = 'ssb-pill ssb-acted';
     pill.title = `${candidate.title} — on your SoulSync wishlist.`;
@@ -802,7 +868,19 @@ function updateCardOverlay(
   if (lib && state === 'in-library') {
     lib.className = 'ss-card-badge ss-card-inlib';
     lib.textContent = '✓';
-    lib.title = `${candidate.title} — in your library`;
+    // TMDB rec cards carry a tmdbId from their href; IMDb/Trakt cards don't
+    // — those stay unclickable rather than fake an identity.
+    const canPlay = typeof candidate.tmdbId === 'number' && candidate.tmdbId > 0;
+    lib.title = canPlay
+      ? `${candidate.title} — in your library. Click to play.`
+      : `${candidate.title} — in your library`;
+    lib.onclick = canPlay
+      ? (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          void playVideoEntry(lib, candidate);
+        }
+      : null;
   } else if (lib && state === 'on-wishlist') {
     lib.className = 'ss-card-badge ss-card-wishlisted';
     lib.textContent = '✓';

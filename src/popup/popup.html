@@ -29,8 +29,9 @@
 
   <main id="main" hidden>
     <nav id="tabs">
-      <button class="tab-btn active" data-tab="nowplaying">Now Playing</button>
+      <button class="tab-btn active" data-tab="nowplaying">Live</button>
       <button class="tab-btn" data-tab="search">Search</button>
+      <button class="tab-btn" data-tab="media">Media</button>
       <button class="tab-btn" data-tab="activity">Activity</button>
       <button class="tab-btn" data-tab="chat">Chat</button>
     </nav>
@@ -118,6 +119,61 @@
         </div>
         <ul id="import-list"></ul>
         <button id="import-send" class="primary block" hidden>Send to SoulSync</button>
+      </section>
+    </div>
+
+    <div id="tab-media" class="tab-panel" hidden>
+      <section class="card" id="player-remote">
+        <div class="row-between">
+          <span class="section-label">Player</span>
+          <span class="pr-head-right">
+            <button id="pr-popout" class="ghost pr-popout" title="Open the mini player panel">⧉</button>
+            <span id="pr-hint" class="muted tiny" hidden>Connect your SoulSync server in Options to play</span>
+          </span>
+        </div>
+        <div class="pr-now">
+          <div class="pr-art-wrap"><img id="pr-art" class="pr-art" alt="" /></div>
+          <div class="pr-meta">
+            <div id="pr-title" class="pr-title">Nothing queued</div>
+            <div id="pr-sub" class="muted"></div>
+            <div id="pr-state" class="muted tiny"></div>
+          </div>
+        </div>
+        <div class="pr-transport">
+          <button id="pr-prev" class="pr-tbtn pr-tbtn-quiet" title="Previous">
+            <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><rect x="2.4" y="3" width="2.6" height="10" rx="1" fill="currentColor"/><path d="M13.6 3.4v9.2c0 .8-.9 1.3-1.6.9l-6.5-4.6c-.6-.4-.6-1.4 0-1.8L12 2.5c.7-.4 1.6.1 1.6.9z" fill="currentColor"/></svg>
+          </button>
+          <button id="pr-toggle" class="primary pr-tbtn" title="Play / pause">&#9654;</button>
+          <button id="pr-next" class="pr-tbtn pr-tbtn-quiet" title="Next">
+            <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><rect x="11" y="3" width="2.6" height="10" rx="1" fill="currentColor"/><path d="M2.4 3.4v9.2c0 .8.9 1.3 1.6.9l6.5-4.6c.6-.4.6-1.4 0-1.8L4 2.5c-.7-.4-1.6.1-1.6.9z" fill="currentColor"/></svg>
+          </button>
+        </div>
+        <div class="pr-seekrow">
+          <span id="pr-pos" class="muted tiny pr-time">0:00</span>
+          <input id="pr-seek" type="range" min="0" max="1" value="0" step="1" aria-label="Seek" />
+          <span id="pr-dur" class="muted tiny pr-time">0:00</span>
+          <input id="pr-vol" type="range" min="0" max="100" value="100" aria-label="Volume" class="pr-vol" />
+        </div>
+        <div id="pr-error" class="pr-error" hidden></div>
+        <div id="pr-empty" class="muted">Queue is empty &mdash; search your library below.</div>
+        <ul id="pr-queue"></ul>
+        <div class="row">
+          <button id="pr-clear" class="secondary">Clear</button>
+          <button id="pr-shuffle" class="secondary">Shuffle</button>
+        </div>
+      </section>
+
+      <section class="card" id="media-card">
+        <div class="row-between">
+          <span class="section-label">Play from library</span>
+          <span id="media-no-config" class="muted tiny" hidden>Connect your SoulSync server in Options to play</span>
+        </div>
+        <div class="row">
+          <input id="media-q" placeholder="Artist, album, or track&hellip;" autocomplete="off" spellcheck="false" />
+          <button id="media-go" class="secondary">Search</button>
+        </div>
+        <div id="media-state" class="muted media-state">Search your library to play.</div>
+        <ul id="media-results"></ul>
       </section>
     </div>
 
