@@ -21,7 +21,12 @@ import {
   artistFromVideoTitle,
   channelArtistFromOgTitle,
   isBadgedYoutubeHost,
+  isMusicChannelName,
+  isTopicChannelName,
+  isTrailerTitle,
+  isVevoChannelName,
   isYoutubeChannelPath,
+  parseTrailerTitle,
   splitArtists,
   trackFromVideoTitle,
 } from "../src/shared/youtube.ts";
@@ -221,6 +226,44 @@ eq("upload strips dash lyric video", trackFromVideoTitle("Drake - One Dance - Ly
 eq("upload strips dash music video", trackFromVideoTitle("Drake - One Dance - Music Video", ""), { artist: "Drake", title: "One Dance" });
 eq("upload keeps dash live", trackFromVideoTitle("Drake - One Dance - Live", ""), { artist: "Drake", title: "One Dance - Live" });
 eq("upload strips stacked suffixes", trackFromVideoTitle("Drake - One Dance - Official Video (Official Audio)", ""), { artist: "Drake", title: "One Dance" });
+
+/* ── youtube trailer detection ── */
+eq("official trailer", isTrailerTitle("Dune: Part Two | Official Trailer"), true);
+eq("final trailer", isTrailerTitle("Avengers: Doomsday | Final Trailer"), true);
+eq("official teaser trailer", isTrailerTitle("THE BATMAN 2 – Official Teaser Trailer"), true);
+eq("redband trailer", isTrailerTitle("Sinners | Official Redband Trailer"), true);
+eq("red band spaced", isTrailerTitle("Sinners | Official Red Band Trailer"), true);
+eq("bare trailer with year", isTrailerTitle("Avengers: Doomsday (2026) - Trailer"), true);
+eq("bare teaser with year", isTrailerTitle("Dune 3 (2027) Teaser"), true);
+eq("reaction is not a trailer", isTrailerTitle("Dune: Part Two Official Trailer Reaction"), false);
+eq("music video is not a trailer", isTrailerTitle("Kendrick Lamar - Not Like Us (Official Video)"), false);
+eq("album teaser is not a trailer", isTrailerTitle("Taylor Swift - Album Teaser"), false);
+eq("vlog trailer w/o year is not a trailer", isTrailerTitle("My Summer Trailer"), false);
+eq("empty -> false", isTrailerTitle("  "), false);
+
+/* ── youtube trailer parsing ── */
+eq("pipe official trailer", parseTrailerTitle("Dune: Part Two | Official Trailer"), { title: "Dune: Part Two", year: null, kindHint: "movie" });
+eq("year in parens", parseTrailerTitle("Avengers: Doomsday (2026) - Official Trailer"), { title: "Avengers: Doomsday", year: 2026, kindHint: "movie" });
+eq("strips channel tag", parseTrailerTitle("Stranger Things 5 | Official Trailer | Netflix", "Netflix"), { title: "Stranger Things 5", year: null, kindHint: "movie" });
+eq("season -> show hint", parseTrailerTitle("Wednesday: Season 2 | Official Trailer | Netflix", "Netflix"), { title: "Wednesday: Season 2", year: null, kindHint: "show" });
+eq("redband", parseTrailerTitle("Sinners | Official Redband Trailer | Warner Bros. Pictures", "Warner Bros. Pictures"), { title: "Sinners", year: null, kindHint: "movie" });
+eq("dash teaser", parseTrailerTitle("THE BATMAN 2 – Official Teaser Trailer"), { title: "THE BATMAN 2", year: null, kindHint: "movie" });
+eq("paren trailer", parseTrailerTitle("Dune: Part Two (Official Trailer)"), { title: "Dune: Part Two", year: null, kindHint: "movie" });
+eq("trailing bare year", parseTrailerTitle("Dune Part Two 2024 | Official Trailer"), { title: "Dune Part Two", year: 2024, kindHint: "movie" });
+eq("limited series -> show hint", parseTrailerTitle("Adolescence | Limited Series Trailer | Netflix", "Netflix"), { title: "Adolescence", year: null, kindHint: "show" });
+eq("non-trailer -> null", parseTrailerTitle("Drake - One Dance (Official Video)"), null);
+eq("empty -> null", parseTrailerTitle(""), null);
+
+/* ── youtube music-channel detection ── */
+eq("topic channel", isTopicChannelName("Drake - Topic"), true);
+eq("topic case-insensitive", isTopicChannelName("drake - topic"), true);
+eq("plain channel not topic", isTopicChannelName("Drake"), false);
+eq("vevo channel", isVevoChannelName("TaylorSwiftVEVO"), true);
+eq("vevo spaced", isVevoChannelName("Ariana Grande Vevo"), true);
+eq("plain channel not vevo", isVevoChannelName("Linus Tech Tips"), false);
+eq("topic is music channel", isMusicChannelName("Kendrick Lamar - Topic"), true);
+eq("vevo is music channel", isMusicChannelName("TaylorSwiftVEVO"), true);
+eq("vlog is not music channel", isMusicChannelName("Linus Tech Tips"), false);
 
 /* ── provider URL IDs (verified URL shapes, Sep 2026) ── */
 eq("deezer album id w/ locale", deezerAlbumIdFromPath("/us/album/674017741"), "674017741");

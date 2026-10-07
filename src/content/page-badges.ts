@@ -5,6 +5,8 @@ import {
   artistFromVideoTitle,
   channelArtistFromOgTitle,
   isBadgedYoutubeHost,
+  isMusicChannelName,
+  isTrailerTitle,
   isYoutubeChannelPath,
   splitArtists,
   trackFromVideoTitle,
@@ -744,25 +746,36 @@ function genericCandidates(): Candidate[] {
 }
 
 /**
- * YouTube artist badges.
+ * YouTube music badges (page-badges owns music; video-badges owns trailers
+ * and channel follows — the shared classifiers keep both scripts in
+ * agreement, so each page gets exactly one pill family).
  *
- * Channel pages: artist from the og:title meta tag ("Drake"; Topic channels
- * are "Drake - Topic"), anchored to the channel name. Watch pages: artist is
- * the part of the video title before " - " ("Drake - One Dance (Lyrics)" ->
- * "Drake"), anchored to the channel name below the title (watchlist is about
- * the artist/channel, not the video); the track pill parses the full
- * "Artist - Track" form and stays on the title. When the title doesn't name
- * an artist, a 🔍 pill by the channel opens manual search. They anchor to
- * different elements (the channel name vs. the inner title span) because
- * mountBadge dedupes on the anchor element.
- * Shorts, search, feeds, and music.youtube.com have no reliable artist
- * signal and are intentionally skipped.
+ * Channel pages: only unambiguous music channels (Topic, VEVO) get the
+ * artist pill — everything else is a normal YouTube channel and gets the
+ * channel-follow pill from video-badges. Watch pages: artist is the part of
+ * the video title before " - " ("Drake - One Dance (Lyrics)" -> "Drake"),
+ * anchored to the channel name below the title (watchlist is about the
+ * artist/channel, not the video); the track pill parses the full
+ * "Artist - Track" form and stays on the title. Trailer-shaped titles are
+ * skipped here (video-badges mounts the movie/show pill); titles that are
+ * neither music nor trailers get the channel-follow pill from video-badges.
+ * They anchor to different elements (the channel name vs. the inner title
+ * span) because mountBadge dedupes on the anchor element.
+ * Shorts, search, feeds, and music.youtube.com have no reliable signal and
+ * are intentionally skipped.
  */
 function youtubeCandidates(): Candidate[] {
   const out: Candidate[] = [];
   const path = location.pathname;
   if (isYoutubeChannelPath(path)) {
-    const name = channelArtistFromOgTitle(metaTag('og:title'));
+    const rawOg = metaTag('og:title');
+    // Only unambiguous music channels — normal channels get the follow
+    // pill from video-badges, never a guessed artist watchlist add.
+    if (!isMusicChannelName(rawOg)) {
+      out.push(...playlistCandidates());
+      return out;
+    }
+    const name = channelArtistFromOgTitle(rawOg);
     const anchor = document.querySelector('#channel-name');
     if (name && anchor) {
       out.push({
@@ -778,6 +791,12 @@ function youtubeCandidates(): Candidate[] {
     const h1 = document.querySelector('h1.ytd-watch-metadata') ?? document.querySelector('h1');
     const inner = h1?.querySelector('yt-formatted-string') ?? undefined;
     const rawTitle = (inner ?? h1)?.textContent?.trim() ?? '';
+    // Trailer-shaped titles belong to video-badges (movie/show pill) —
+    // never parse them as "Artist - Track".
+    if (isTrailerTitle(rawTitle)) {
+      out.push(...playlistCandidates());
+      return out;
+    }
     // The artist pill lives by the CHANNEL name below the title — watchlist
     // is about the artist/channel, not the video. The artist is still
     // resolved from the title context; only the placement changes.
@@ -801,19 +820,10 @@ function youtubeCandidates(): Candidate[] {
         primary: true,
         provider: pageProvider(),
       });
-    } else if (channelName && channelAnchor) {
-      // The title doesn't name the artist — offer manual search by the
-      // channel instead of a guessed watchlist add.
-      out.push({
-        kind: 'artist',
-        name: channelName,
-        anchor: channelAnchor,
-        pageUrl: location.href,
-        primary: true,
-        provider: pageProvider(),
-        manualSearch: true,
-      });
     }
+    // Not music and not a trailer: video-badges mounts the channel-follow
+    // pill by the channel name. (The old 🔍 manual-search pill is retired —
+    // a normal channel's video gets a channel follow, not a guessed artist.)
     const track = trackFromVideoTitle(rawTitle, channelName);
     const trackAnchor = inner && inner !== h1 ? inner : h1?.parentElement;
     if (track && trackAnchor && trackAnchor !== h1) {

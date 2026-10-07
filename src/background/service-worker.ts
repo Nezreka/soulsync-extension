@@ -22,6 +22,9 @@ import {
   addVideoToWishlist,
   addShowToWatchlist,
   removeShowFromWatchlist,
+  resolveYoutubeChannel,
+  followYoutubeChannel,
+  unfollowYoutubeChannel,
   searchPerson,
   personOnWatchlist,
   addPersonToWatchlist,
@@ -174,6 +177,21 @@ export type VideoBadgeAction =
       action: 'unwatch-person';
       name: string;
       tmdbId?: number;
+    }
+  | {
+      type: 'SOULSYNC_VIDEO_BADGE_ACTION';
+      action: 'check-channel';
+      url: string;
+    }
+  | {
+      type: 'SOULSYNC_VIDEO_BADGE_ACTION';
+      action: 'follow-channel';
+      channel: { youtube_id: string; title: string; avatar_url: string };
+    }
+  | {
+      type: 'SOULSYNC_VIDEO_BADGE_ACTION';
+      action: 'unfollow-channel';
+      youtube_id: string;
     };
 
 const RELEASE_SOURCES: ReadonlySet<string> = new Set([
@@ -476,6 +494,23 @@ async function handleVideoBadgeAction(m: VideoBadgeAction): Promise<Record<strin
         ? await addPersonToWatchlist(cfg, hit)
         : await removePersonFromWatchlist(cfg, hit.tmdbId);
       return ok ? { ok: true } : { error: 'Watchlist update failed.' };
+    }
+    if (m.action === 'check-channel') {
+      return throttledVideoCheck(async () => {
+        const ch = await resolveYoutubeChannel(cfg, m.url);
+        if (!ch) return { following: null };
+        return { following: ch.following, youtube_id: ch.youtube_id, title: ch.title, avatar_url: ch.avatar_url };
+      });
+    }
+    if (m.action === 'follow-channel') {
+      const r = await followYoutubeChannel(cfg, m.channel);
+      return r.ok
+        ? { ok: true, youtube_id: r.youtube_id }
+        : { error: "Couldn't follow that channel." };
+    }
+    if (m.action === 'unfollow-channel') {
+      const ok = await unfollowYoutubeChannel(cfg, m.youtube_id);
+      return ok ? { ok: true } : { error: "Couldn't unfollow that channel." };
     }
     return { error: 'Unknown video badge action.' };
   } catch (e) {

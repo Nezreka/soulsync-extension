@@ -69,7 +69,8 @@
         "*://*.imdb.com/*",
         "*://*.themoviedb.org/*",
         "*://*.trakt.tv/*",
-        "*://*.letterboxd.com/*"
+        "*://*.letterboxd.com/*",
+        "*://*.youtube.com/*"
       ],
       "run_at": "document_idle"
     }

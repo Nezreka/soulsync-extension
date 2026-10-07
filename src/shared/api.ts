@@ -1313,6 +1313,80 @@ export async function removeShowFromWatchlist(cfg: ServerConfig, tmdbId: number)
   }
 }
 
+export interface YoutubeChannelRef {
+  youtube_id: string;
+  title: string;
+  avatar_url: string;
+  following: boolean;
+}
+
+/**
+ * Resolve a YouTube channel URL without committing (preview + follow state).
+ * Null when the server can't resolve it (bad URL, no yt-dlp, older server
+ * without the v1 youtube relays) — callers show the honest unknown state.
+ */
+export async function resolveYoutubeChannel(
+  cfg: ServerConfig,
+  url: string,
+): Promise<YoutubeChannelRef | null> {
+  try {
+    const data = await apiFetch(
+      cfg,
+      `${V1}/video/youtube/resolve?url=${encodeURIComponent(url)}&limit=1`,
+      { method: 'GET' },
+    );
+    const ch = (data as Record<string, unknown>).channel as Record<string, unknown> | undefined;
+    const youtube_id = typeof ch?.youtube_id === 'string' ? ch.youtube_id : '';
+    if (!youtube_id) return null;
+    return {
+      youtube_id,
+      title: typeof ch?.title === 'string' ? ch.title : '',
+      avatar_url: typeof ch?.avatar_url === 'string' ? ch.avatar_url : '',
+      following: (data as Record<string, unknown>).following === true,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Follow a YouTube channel — the exact payload the SoulSync web UI sends
+ * when a user follows a channel in-app: {channel: {youtube_id, title,
+ * avatar_url}} (no video list; the server's date enricher backfills the
+ * catalog in the background). Same standard, same behavior.
+ */
+export async function followYoutubeChannel(
+  cfg: ServerConfig,
+  channel: { youtube_id: string; title: string; avatar_url: string },
+): Promise<{ ok: boolean; youtube_id: string }> {
+  try {
+    const data = await apiFetch(cfg, `${V1}/video/youtube/follow`, {
+      method: 'POST',
+      body: JSON.stringify({ channel }),
+    });
+    const ch = (data as Record<string, unknown>).channel as Record<string, unknown> | undefined;
+    return {
+      ok: (data as Record<string, unknown>).following === true,
+      youtube_id: typeof ch?.youtube_id === 'string' ? ch.youtube_id : '',
+    };
+  } catch {
+    return { ok: false, youtube_id: '' };
+  }
+}
+
+/** Unfollow a YouTube channel. Wished videos stay in place (server behavior). */
+export async function unfollowYoutubeChannel(cfg: ServerConfig, youtube_id: string): Promise<boolean> {
+  try {
+    const data = await apiFetch(cfg, `${V1}/video/youtube/unfollow`, {
+      method: 'POST',
+      body: JSON.stringify({ youtube_id }),
+    });
+    return (data as Record<string, unknown>).following === false;
+  } catch {
+    return false;
+  }
+}
+
 export interface PersonSearchHit {
   tmdbId: number;
   name: string;

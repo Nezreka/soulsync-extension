@@ -1,6 +1,15 @@
 import browser from 'webextension-polyfill';
 import { BADGES_ENABLED_KEY, badgesEnabledFromStored } from '../shared/api.js';
 import type { OpenVideoResponse, PendingVideoEntry } from '../player/types.js';
+import {
+  channelArtistFromOgTitle,
+  isBadgedYoutubeHost,
+  isMusicChannelName,
+  isTrailerTitle,
+  isYoutubeChannelPath,
+  parseTrailerTitle,
+  trackFromVideoTitle,
+} from '../shared/youtube.js';
 import badgeCssText from './page-badges.css';
 
 /**
@@ -13,9 +22,16 @@ import badgeCssText from './page-badges.css';
  *   scanning. A missing anchor skips the candidate silently.
  * - All server traffic goes through the background worker.
  * - Badge chrome lives in shadow DOM so page CSS/CSP can't touch it.
+ *
+ * YouTube: trailer-shaped watch pages ("Official Trailer", "Redband", …)
+ * get the movie/show pill on the title (the server re-resolves the real
+ * kind); non-music, non-trailer watch pages and non-music channel pages get
+ * a channel-follow pill. Music (Topic/VEVO channels, "Artist - Track"
+ * titles) stays with page-badges — the shared classifiers in
+ * shared/youtube.ts keep the two scripts in agreement.
  */
 
-export type VideoProvider = 'imdb' | 'tmdb' | 'trakt' | 'letterboxd';
+export type VideoProvider = 'imdb' | 'tmdb' | 'trakt' | 'letterboxd' | 'youtube';
 
 function videoProvider(): VideoProvider | undefined {
   const h = location.hostname;
@@ -23,6 +39,7 @@ function videoProvider(): VideoProvider | undefined {
   if (h.includes('themoviedb.org')) return 'tmdb';
   if (h.includes('trakt.tv')) return 'trakt';
   if (h.includes('letterboxd.com')) return 'letterboxd';
+  if (isBadgedYoutubeHost(h)) return 'youtube';
   return undefined;
 }
 
@@ -120,6 +137,247 @@ function extractCandidate(provider: VideoProvider): VideoCandidate | undefined {
   }
 
   return undefined;
+}
+
+/* ── YouTube ── */
+
+interface YoutubeWatchMeta {
+  rawTitle: string;
+  /** Inner title span (where the pill mounts, like the music track pill). */
+  titleAnchor: Element;
+  channelName: string;
+  channelAnchor: Element | null;
+  channelUrl: string;
+}
+
+/** Watch-page title + channel, using the same selectors as page-badges. */
+function youtubeWatchMeta(): YoutubeWatchMeta | null {
+  const h1 = document.querySelector('h1.ytd-watch-metadata') ?? document.querySelector('h1');
+  const inner = h1?.querySelector('yt-formatted-string') ?? undefined;
+  const rawTitle = (inner ?? h1)?.textContent?.trim() ?? '';
+  if (!rawTitle) return null;
+  const channelAnchor =
+    document.querySelector('#owner #channel-name') ??
+    document.querySelector('ytd-video-owner-renderer #channel-name') ??
+    document.querySelector('#channel-name');
+  const channelName = channelAnchor?.textContent?.trim() ?? '';
+  // The channel link wrapping the name gives the canonical channel URL —
+  // the watch URL itself is useless for follow/resolve.
+  const ownerLink =
+    (channelAnchor?.closest('a[href]') as HTMLAnchorElement | null) ??
+    (document.querySelector(
+      '#owner a[href^="/@"], #owner a[href^="/channel/"], #owner a[href^="/c/"], #owner a[href^="/user/"]',
+    ) as HTMLAnchorElement | null);
+  const href = ownerLink?.getAttribute('href') ?? '';
+  const channelUrl = href ? new URL(href, location.origin).href : '';
+  return {
+    rawTitle,
+    titleAnchor: inner ?? h1 ?? document.body,
+    channelName,
+    channelAnchor,
+    channelUrl,
+  };
+}
+
+/** Trailer-shaped watch pages: the movie/show the trailer is for. */
+function extractYoutubeTrailer(): VideoCandidate | undefined {
+  if (location.pathname !== '/watch') return undefined;
+  const meta = youtubeWatchMeta();
+  if (!meta) return undefined;
+  const info = parseTrailerTitle(meta.rawTitle, meta.channelName);
+  if (!info) return undefined;
+  return {
+    title: info.title,
+    year: info.year,
+    kind: info.kindHint,
+    anchor: meta.titleAnchor,
+    provider: 'youtube',
+  };
+}
+
+interface YoutubeChannelCandidate {
+  name: string;
+  /** Channel URL (page URL on channel pages, owner link on watch pages). */
+  url: string;
+  anchor: Element;
+}
+
+/**
+ * The "normal YouTube channel" pill: channel pages that aren't unambiguously
+ * music (Topic/VEVO — page-badges owns those), and watch pages that are
+ * neither trailers nor music. Anything else belongs to another pill.
+ */
+function extractYoutubeChannel(): YoutubeChannelCandidate | undefined {
+  const path = location.pathname;
+  if (isYoutubeChannelPath(path)) {
+    const rawOg =
+      document.querySelector('meta[property="og:title"]')?.getAttribute('content') ?? '';
+    if (isMusicChannelName(rawOg)) return undefined;
+    const name =
+      channelArtistFromOgTitle(rawOg).trim() ||
+      document.title.replace(/\s*[-–|]\s*YouTube\s*$/, '').trim();
+    if (!name) return undefined;
+    const anchor = document.querySelector('#channel-name') ?? document.body;
+    return { name, url: location.href, anchor };
+  }
+  if (path === '/watch') {
+    const meta = youtubeWatchMeta();
+    if (!meta) return undefined;
+    if (isTrailerTitle(meta.rawTitle)) return undefined;
+    if (trackFromVideoTitle(meta.rawTitle, meta.channelName)) return undefined;
+    if (!meta.channelName || !meta.channelAnchor || !meta.channelUrl) return undefined;
+    return { name: meta.channelName, url: meta.channelUrl, anchor: meta.channelAnchor };
+  }
+  return undefined;
+}
+
+/**
+ * Channel-follow pill: 👁 Follow / 👁 Following, two-click unfollow verify
+ * (parity with the show/person eyes). Follow wishes the channel's recent
+ * uploads; unfollow leaves wished videos in place (server behavior).
+ */
+function channelPillFor(c: YoutubeChannelCandidate): HTMLElement {
+  const host = document.createElement('span');
+  host.className = 'ssb-host ss-video-badge-host';
+  const shadow = host.attachShadow({ mode: 'open' });
+  const style = document.createElement('style');
+  style.textContent = badgeCssText;
+  shadow.appendChild(style);
+
+  const pill = document.createElement('button');
+  pill.type = 'button';
+  pill.className = 'ssb-pill ssb-loading';
+  pill.innerHTML = '<span class="ssb-dot"></span>';
+  pill.title = 'Checking your SoulSync watchlist…';
+  pill.setAttribute('aria-label', `${c.name}: checking your SoulSync watchlist`);
+  shadow.appendChild(pill);
+
+  let youtubeId = '';
+  let resolvedChannel: { youtube_id: string; title: string; avatar_url: string } | null = null;
+  let armed = false;
+  const render = (following: boolean | null): void => {
+    armed = false;
+    if (following === null) {
+      pill.className = 'ssb-pill ssb-unknown';
+      pill.textContent = '?';
+      pill.title = "Couldn't check your SoulSync watchlist";
+      pill.setAttribute('aria-label', `${c.name}: couldn't check your SoulSync watchlist.`);
+      return;
+    }
+    if (following) {
+      pill.className = 'ssb-pill ssb-vwatching';
+      pill.innerHTML = '<span aria-hidden="true">👁</span><span>Following</span>';
+      pill.title = `${c.name} — you're following this channel. Click to unfollow.`;
+      pill.setAttribute('aria-label', `${c.name}: following. Click to unfollow.`);
+    } else {
+      pill.className = 'ssb-pill ssb-vnotwatching';
+      pill.innerHTML = '<span aria-hidden="true">👁</span><span>Follow</span>';
+      pill.title = `Follow ${c.name} — new uploads are wishlisted to your SoulSync.`;
+      pill.setAttribute('aria-label', `${c.name}: not following. Click to follow.`);
+    }
+  };
+  const renderArmed = (): void => {
+    armed = true;
+    pill.className = 'ssb-pill ssb-vunwatch-armed';
+    pill.innerHTML = '<span aria-hidden="true">👁</span><span>Click to unfollow</span>';
+    pill.title = `${c.name} — click again to confirm unfollow.`;
+    pill.setAttribute('aria-label', `${c.name}: click again to confirm unfollow.`);
+  };
+
+  pill.addEventListener('click', async (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const following = pill.classList.contains('ssb-vwatching') || armed;
+    if (following && !armed) {
+      renderArmed();
+      return;
+    }
+    pill.disabled = true;
+    if (following) {
+      const res = (await browser.runtime
+        .sendMessage({
+          type: 'SOULSYNC_VIDEO_BADGE_ACTION',
+          action: 'unfollow-channel',
+          youtube_id: youtubeId,
+        })
+        .catch(() => null)) as { ok?: boolean } | null;
+      if (res?.ok) render(false);
+      else {
+        // Failed: restore the armed state so the intent is clear.
+        if (armed) render(true);
+        pill.title = `${c.name} — couldn't unfollow.`;
+      }
+    } else {
+      pill.className = 'ssb-pill ssb-loading';
+      pill.innerHTML = '<span class="ssb-dot"></span>';
+      // Follow with the already-resolved channel object — the same payload
+      // the SoulSync web UI sends when following in-app ({channel:
+      // {youtube_id, title, avatar_url}}), so no second yt-dlp resolve and
+      // identical server behavior.
+      if (!resolvedChannel) {
+        const chk = (await browser.runtime
+          .sendMessage({
+            type: 'SOULSYNC_VIDEO_BADGE_ACTION',
+            action: 'check-channel',
+            url: c.url,
+          })
+          .catch(() => null)) as {
+          following?: boolean | null;
+          youtube_id?: string;
+          title?: string;
+          avatar_url?: string;
+        } | null;
+        if (chk?.youtube_id) {
+          youtubeId = chk.youtube_id;
+          resolvedChannel = {
+            youtube_id: chk.youtube_id,
+            title: typeof chk.title === 'string' && chk.title ? chk.title : c.name,
+            avatar_url: typeof chk.avatar_url === 'string' ? chk.avatar_url : '',
+          };
+        }
+      }
+      const res = resolvedChannel
+        ? ((await browser.runtime
+            .sendMessage({
+              type: 'SOULSYNC_VIDEO_BADGE_ACTION',
+              action: 'follow-channel',
+              channel: resolvedChannel,
+            })
+            .catch(() => null)) as { ok?: boolean; youtube_id?: string } | null)
+        : null;
+      if (res?.ok) {
+        if (res.youtube_id) youtubeId = res.youtube_id;
+        render(true);
+      } else {
+        render(false);
+        pill.title = `${c.name} — couldn't follow that channel.`;
+      }
+    }
+    pill.disabled = false;
+  });
+
+  // Resolve follow state in the background.
+  browser.runtime
+    .sendMessage({
+      type: 'SOULSYNC_VIDEO_BADGE_ACTION',
+      action: 'check-channel',
+      url: c.url,
+    })
+    .then((res: unknown) => {
+      const r = res as { following?: boolean | null; youtube_id?: string; title?: string; avatar_url?: string };
+      if (typeof r?.youtube_id === 'string') {
+        youtubeId = r.youtube_id;
+        resolvedChannel = {
+          youtube_id: r.youtube_id,
+          title: typeof r?.title === 'string' && r.title ? r.title : c.name,
+          avatar_url: typeof r?.avatar_url === 'string' ? r.avatar_url : '',
+        };
+      }
+      render(r?.following ?? null);
+    })
+    .catch(() => render(null));
+
+  return host;
 }
 
 type VideoPillState = 'loading' | 'in-library' | 'on-wishlist' | 'addable' | 'unknown';
@@ -338,6 +596,11 @@ async function run(): Promise<void> {
   const provider = videoProvider();
   if (!provider) return;
 
+  if (provider === 'youtube') {
+    await runYoutube();
+    return;
+  }
+
   // Person pages get a watchlist eye; cast lists get compact eyes per actor.
   const person = extractPerson(provider);
   if (person) {
@@ -353,17 +616,48 @@ async function run(): Promise<void> {
   }
 
   const candidate = extractCandidate(provider);
-  if (candidate) {
-    // Insert a loading pill immediately; resolve status in the background.
-    const host = pillFor(candidate, 'loading', null);
-    const anchor = candidate.anchor;
+  if (candidate) mountVideoPill(candidate);
+
+  // Cast lists + recommendations on title pages.
+  mountCastEyes(provider);
+  mountRecBadges(provider);
+}
+
+/** YouTube: trailer-shaped watch pages get the movie/show pill on the title;
+ *  non-music channel pages and non-music, non-trailer watch pages get the
+ *  channel-follow pill. Music stays with page-badges. */
+async function runYoutube(): Promise<void> {
+  const trailer = extractYoutubeTrailer();
+  if (trailer) {
+    mountVideoPill(trailer);
+    return;
+  }
+  const channel = extractYoutubeChannel();
+  if (channel) {
+    const host = channelPillFor(channel);
+    const anchor = channel.anchor;
     if (anchor === document.body) {
       host.style.cssText = 'position:fixed;top:12px;right:12px;z-index:2147483647;';
       document.body.appendChild(host);
     } else {
       anchor.appendChild(host);
     }
+  }
+}
 
+/** Mount a page-subject video pill and resolve its library/wishlist state. */
+function mountVideoPill(candidate: VideoCandidate): void {
+  // Insert a loading pill immediately; resolve status in the background.
+  const host = pillFor(candidate, 'loading', null);
+  const anchor = candidate.anchor;
+  if (anchor === document.body) {
+    host.style.cssText = 'position:fixed;top:12px;right:12px;z-index:2147483647;';
+    document.body.appendChild(host);
+  } else {
+    anchor.appendChild(host);
+  }
+
+  void (async () => {
     try {
       const res = (await browser.runtime.sendMessage({
         type: 'SOULSYNC_VIDEO_BADGE_ACTION',
@@ -384,11 +678,7 @@ async function run(): Promise<void> {
     } catch {
       host.replaceWith(pillFor(candidate, 'unknown', null));
     }
-  }
-
-  // Cast lists + recommendations on title pages.
-  mountCastEyes(provider);
-  mountRecBadges(provider);
+  })();
 }
 
 interface PersonCandidate {
