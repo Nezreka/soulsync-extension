@@ -1,5 +1,5 @@
 {
-  "description": "Browser companion for SoulSync \u2014 send what's playing, selected text, or release pages straight to your server.",
+  "description": "Browser companion for SoulSync — send what's playing, selected text, or release pages straight to your server.",
   "devDependencies": {
     "@types/chrome": "^0.0.280",
     "@types/webextension-polyfill": "^0.12.6",
@@ -18,5 +18,5 @@
     "package": "npm run build && node scripts/package.mjs"
   },
   "type": "module",
-  "version": "0.1.0"
+  "version": "0.2.0"
 }

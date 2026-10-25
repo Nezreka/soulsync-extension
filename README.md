@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Nezreka/soulsync-extension/releases"><img alt="Version" src="https://img.shields.io/badge/version-0.1.0-8b5cf6?style=flat-square"></a>
+  <a href="https://github.com/Nezreka/soulsync-extension/releases"><img alt="Version" src="https://img.shields.io/badge/version-0.2.0-8b5cf6?style=flat-square"></a>
   <a href="https://discord.gg/wGvKqVQwmy"><img alt="Discord" src="https://img.shields.io/badge/discord-join-5865F2?style=flat-square&logo=discord&logoColor=white"></a>
   <a href="https://ko-fi.com/boulderbadgedad"><img alt="Ko-fi" src="https://img.shields.io/badge/support-ko--fi-ff5e5b?style=flat-square&logo=kofi&logoColor=white"></a>
 </p>
