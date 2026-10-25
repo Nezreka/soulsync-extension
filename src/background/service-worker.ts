@@ -237,13 +237,35 @@ const throttledVideoCheck = throttledBadgeCheck;
  */
 const ARTIST_RESOLVE_TTL_MS = 10 * 60_000;
 const artistResolveCache = new Map<string, { at: number; p: Promise<ArtistHit | null> }>();
+const ARTIST_RESOLVE_NULL_TTL_MS = 90_000;
 function resolveArtistHit(cfg: ServerConfig, name: string): Promise<ArtistHit | null> {
-  const key = normName(name);
+  // Keyed by server as well as name: the same artist name resolved against
+  // a different server is a different answer.
+  const key = `${cfg.url}|${normName(name)}`;
   const hit = artistResolveCache.get(key);
   if (hit && Date.now() - hit.at < ARTIST_RESOLVE_TTL_MS) return hit.p;
   const p = searchArtists(cfg, name, 5).then((hits) => pickBestArtist(hits, name));
   artistResolveCache.set(key, { at: Date.now(), p });
-  p.catch(() => artistResolveCache.delete(key));
+  p.then(
+    (v) => {
+      // A no-match is remembered only briefly: the full TTL would poison
+      // watch checks for 10 minutes when the metadata source catches up,
+      // but no memory at all makes every SPA re-scan of an unresolvable
+      // artist (recycled rows remount and re-ask) cost a fresh external
+      // search. Shorten this entry's remaining life instead of deleting.
+      if (v === null && artistResolveCache.get(key)?.p === p) {
+        artistResolveCache.set(key, {
+          at: Date.now() - (ARTIST_RESOLVE_TTL_MS - ARTIST_RESOLVE_NULL_TTL_MS),
+          p,
+        });
+      }
+    },
+    () => {
+      // Failures aren't remembered (only delete our own entry — a newer
+      // resolve for the same key may already have replaced it).
+      if (artistResolveCache.get(key)?.p === p) artistResolveCache.delete(key);
+    },
+  );
   return p;
 }
 

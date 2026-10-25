@@ -120,6 +120,14 @@ interface BadgeRec {
   /** The anchor's text when the badge was mounted — used to spot SPA text
    *  swaps (YouTube reuses the h1 and rewrites its textContent in place). */
   anchorText: string;
+  /** Subject text probed fresh at sweep time for candidates whose identity
+   *  does NOT live in their anchor: a YouTube artist pill is anchored to the
+   *  channel name but names an artist parsed from the video TITLE — a
+   *  same-channel navigation to a non-music video changes the title while
+   *  the anchor text stays identical, so the anchor probe alone can never
+   *  see it. `probeYtTitle` records the h1 title text at mount; the sweep
+   *  re-reads the current h1 and compares. Null for all other candidates. */
+  probeYtTitle: string | null;
   /** Watchlist tri-state for the artist named by a track/album candidate —
    *  the card's artist row renders this. null = unknown. */
   artistWatchState: boolean | null;
@@ -259,11 +267,22 @@ function spotifyCandidates(): Candidate[] {
   // artist when now-playing showed the same artist, and the tracklist row
   // when now-playing played the same track.
   const seenAnchors = new Set<Element>();
+  // The cap limits NEW badges per scan, not candidates: already-badged
+  // anchors must still be collected so the stale sweep can compare their
+  // keys (a recycled track row's badge is only detectable if the row's new
+  // candidate reaches the sweep). Counting them starved every surface
+  // below the first 30 badged rows on dense pages.
+  let freshCount = 0;
   const push = (c: Omit<Candidate, 'pageUrl' | 'provider'>): void => {
     const name = c.name.trim();
     if (name.length < 2 || name.length > 80 || name.includes('\n')) return;
-    if (seenAnchors.has(c.anchor) || out.length >= MAX_PER_SCAN) return;
+    if (seenAnchors.has(c.anchor)) return;
+    // Primary (page-subject) candidates are exempt: the page's own header
+    // pill must never wait behind a wall of fresh rows.
+    const isFresh = !c.primary && !c.anchor.hasAttribute(HOST_ATTR);
+    if (isFresh && freshCount >= MAX_PER_SCAN) return;
     seenAnchors.add(c.anchor);
+    if (isFresh) freshCount++;
     out.push({ ...c, name, pageUrl: location.href, provider: 'spotify' });
   };
   const path = location.pathname;
@@ -458,9 +477,6 @@ function spotifyCandidates(): Candidate[] {
   // skipped — never guessed. Exactly one pill per row: rescans never
   // double-badge, even if the anchor changed between scans.
   document.querySelectorAll('[data-testid="tracklist-row"]').forEach((row) => {
-    // One pill per row, period — rescans must never double-badge a row even
-    // if the anchor changed between scans (e.g. the + button appearing late).
-    if (row.querySelector('.ssb-host')) return;
     // Broque's console: the rows exist but internal-track-link doesn't —
     // fall back to any /track/ link in the row.
     const link =
@@ -475,11 +491,22 @@ function spotifyCandidates(): Candidate[] {
     // (album/playlist pages); on Liked Songs the tracks are already liked,
     // so fall back to the row's "More options" (...) button — still the
     // right action cell, never the title.
+    // A row that already carries a pill keeps THAT pill's anchor: the
+    // candidate is still emitted (under the existing anchor) so the stale
+    // sweep can compare keys — virtualised lists recycle rows in place, and
+    // the pill's anchor is an icon button whose text never changes when the
+    // track does, so without the emitted candidate a recycled row's pill
+    // would keep naming (and acting on) the previous track forever. One
+    // pill per row, period: never mount a second anchor in the same row.
+    const existingHost = row.querySelector('.ssb-host') as HTMLElement | null;
+    const existingAnchor = existingHost ? badges.get(existingHost)?.candidate.anchor : undefined;
     const anchor =
-      row.querySelector('button[aria-label="Add to Liked Songs"]') ??
-      row.querySelector('button[aria-label^="More options for"]') ??
-      row.querySelector('button[aria-label="More options"]') ??
-      link;
+      existingAnchor && row.contains(existingAnchor)
+        ? existingAnchor
+        : row.querySelector('button[aria-label="Add to Liked Songs"]') ??
+          row.querySelector('button[aria-label^="More options for"]') ??
+          row.querySelector('button[aria-label="More options"]') ??
+          link;
     push({ kind: 'track', name: trackTitle, artist, anchor, compact: true });
   });
 
@@ -887,7 +914,17 @@ function deezerArtistHeader(): HTMLElement | null {
  */
 function deezerCandidates(): Candidate[] {
   const out: Candidate[] = [];
+  // Same per-scan cap as Spotify, counting only anchors not yet badged:
+  // already-badged candidates still flow to the stale sweep for key
+  // comparison, but a dense page can't fire an unbounded lookup burst.
+  let freshCount = 0;
   const push = (c: Candidate) => {
+    // Primary (page-subject) candidates exempt, as in the Spotify cap:
+    // rows are collected before the header candidate on Deezer pages, so
+    // without this the page's own header pill waits a scan per 30 rows.
+    const isFresh = !c.primary && !c.anchor.hasAttribute(HOST_ATTR);
+    if (isFresh && freshCount >= MAX_PER_SCAN) return;
+    if (isFresh) freshCount++;
     out.push(c);
   };
 
@@ -900,8 +937,6 @@ function deezerCandidates(): Candidate[] {
   //   [aria-label="View menu"] (...). The pill goes after these buttons —
   //   Broque: "next the microphone, heart, and '...'" — never on the title.
   document.querySelectorAll('div[role="row"]').forEach((row) => {
-    // One pill per row, period.
-    if (row.querySelector('.ssb-host')) return;
     const titleEl = row.querySelector('[data-testid="title"]');
     const rawTitle = titleEl?.textContent?.trim() ?? '';
     if (rawTitle.length < 2) return;
@@ -915,12 +950,23 @@ function deezerCandidates(): Candidate[] {
     const artist = artistMatch?.[1]?.trim() ?? '';
     if (artist.length < 2) return;
     // Right-side anchor: after the last action button (heart, ..., lyrics).
+    // One pill per row, period — but still emit the candidate under the
+    // EXISTING pill's anchor when the row is already badged, so the stale
+    // sweep can spot a recycled row (the anchor is an icon button whose
+    // text never changes when the track does).
     const actionBtns = [
       ...row.querySelectorAll<HTMLButtonElement>(
         'button[aria-label="Add to Favorite tracks"], button[aria-label="View menu"], button[aria-label="Lyrics"]',
       ),
     ];
-    const anchor = actionBtns.length > 0 ? actionBtns[actionBtns.length - 1] : titleEl;
+    const existingHost = row.querySelector('.ssb-host') as HTMLElement | null;
+    const existingAnchor = existingHost ? badges.get(existingHost)?.candidate.anchor : undefined;
+    const anchor =
+      existingAnchor && row.contains(existingAnchor)
+        ? existingAnchor
+        : actionBtns.length > 0
+          ? actionBtns[actionBtns.length - 1]
+          : titleEl;
     push({
       kind: 'track',
       name: trackTitle,
@@ -1232,6 +1278,13 @@ function mountBadge(c: Candidate): HTMLElement {
     watchState: null,
     watchStates: {},
     anchorText: c.anchor.textContent ?? '',
+    // YouTube artist pills name an artist parsed from the video title but
+    // anchor to the channel name — probe the title itself (see BadgeRec).
+    probeYtTitle:
+      c.provider === 'youtube' && c.kind === 'artist'
+        ? (document.querySelector('h1.ytd-watch-metadata') ?? document.querySelector('h1'))
+            ?.textContent ?? null
+        : null,
     artistWatchState: null,
     pop: null,
     popLayer: null,
@@ -1303,7 +1356,12 @@ async function onWishlistPillClick(host: HTMLElement): Promise<void> {
   if (c.kind === 'album' && (!c.tracks || c.tracks.length === 0)) {
     togglePopover(host);
     if (rec.pop)
-      showError(rec, "Couldn't load this album's tracklist from here — open the album page to wishlist it.");
+      showError(
+        rec,
+        c.primary
+          ? "This page doesn't expose the album's tracklist, so it can't be wishlisted from here."
+          : "Couldn't load this album's tracklist from here — open the album page to wishlist it.",
+      );
     return;
   }
   // Busy state: not clickable while the add is in flight.
@@ -2130,7 +2188,12 @@ async function onWishlistAlbum(rec: BadgeRec, btn: HTMLButtonElement): Promise<v
   // Album cards don't carry a tracklist — never pretend to wishlist zero
   // tracks. Say plainly what the user can do instead.
   if (!c.tracks || c.tracks.length === 0) {
-    showError(rec, "Couldn't load this album's tracklist from here — open the album page to wishlist it.");
+    showError(
+      rec,
+      c.primary
+        ? "This page doesn't expose the album's tracklist, so it can't be wishlisted from here."
+        : "Couldn't load this album's tracklist from here — open the album page to wishlist it.",
+    );
     return;
   }
   btn.disabled = true;
@@ -2557,6 +2620,7 @@ const recServerUrl = new Map<HTMLElement, string>();
 /** Remove a badge: close its popover, detach the host, forget the record,
  *  and free the anchor for remounting. */
 function dropBadge(host: HTMLElement, rec: BadgeRec): void {
+  clearUnwatchArm(host);
   if (rec.pop) closePopover(rec);
   host.remove();
   badges.delete(host);
@@ -2740,7 +2804,14 @@ async function scan(): Promise<void> {
     const anchor = rec.candidate.anchor;
     const nowKey = byAnchor.get(anchor);
     if (nowKey === badgeKeyFor(rec.candidate)) return; // still valid
-    if (nowKey !== undefined || (anchor.textContent ?? '') !== rec.anchorText) {
+    // YouTube artist pills: probe the live title — a same-channel swap to a
+    // non-music video yields no new artist candidate AND leaves the channel
+    // anchor text untouched, but the title changed, so the pill is stale.
+    const titleStale =
+      rec.probeYtTitle !== null &&
+      ((document.querySelector('h1.ytd-watch-metadata') ?? document.querySelector('h1'))
+        ?.textContent ?? null) !== rec.probeYtTitle;
+    if (nowKey !== undefined || titleStale || (anchor.textContent ?? '') !== rec.anchorText) {
       dropBadge(host, rec);
     }
     // Anchor yields nothing but its text is unchanged: probably a loading
@@ -2830,16 +2901,25 @@ function quiet(p: Promise<unknown>): void {
   p.catch(() => undefined);
 }
 
+let scanWaitStart = 0;
 function scheduleScan(): void {
-  if (timer !== null) return;
   if (!checkContext()) return;
   if (!badgesEnabled) return;
+  // Trailing debounce, not a throttle: every new mutation re-arms the
+  // timer, so a scan runs against the SETTLED DOM. The old throttle let a
+  // timer armed before an SPA swap fire mid-swap and read the previous
+  // page's DOM. A max wait bounds starvation under constant churn.
+  const now = Date.now();
+  if (timer === null) scanWaitStart = now;
+  else window.clearTimeout(timer);
+  const delay = now - scanWaitStart >= 2500 ? 0 : 800;
   timer = window.setTimeout(() => {
     timer = null;
+    scanWaitStart = 0;
     if (!checkContext()) return;
     if (!badgesEnabled) return;
     quiet(scan());
-  }, 800);
+  }, delay);
 }
 
 async function boot(): Promise<void> {
