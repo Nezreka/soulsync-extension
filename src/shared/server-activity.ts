@@ -1,4 +1,5 @@
 import type { ServerConfig } from './types.js';
+import { serverFetch } from './http.js';
 
 /**
  * SoulSync live server-activity client (the Tautulli-style view).
@@ -84,7 +85,7 @@ function withKey(cfg: ServerConfig, path: string): string {
 }
 
 async function sactFetch<T>(cfg: ServerConfig, path: string, init: RequestInit = {}): Promise<T> {
-  const res = await fetch(withKey(cfg, path), {
+  const res = await serverFetch(withKey(cfg, path), {
     ...init,
     headers: { Accept: 'application/json', ...(init.headers || {}) },
   });

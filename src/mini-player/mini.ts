@@ -8,7 +8,7 @@
  * on a 1s poll.
  */
 import browser from 'webextension-polyfill';
-import { getConfig, getRecentlyAdded, getRecentlyPlayed, getPlaylists, getPlaylistTracks, normName } from '../shared/api.js';
+import { getConfig, getRecentlyAdded, getRecentlyPlayed, getPlaylists, getPlaylistTracks, normName, serverArtwork } from '../shared/api.js';
 import type { RecentAlbum, RecentTrack, Playlist } from '../shared/api.js';
 import { lookupCoverArt } from '../shared/artwork.js';
 import type { ServerConfig } from '../shared/types.js';
@@ -380,7 +380,9 @@ function renderRecentlyAdded(albums: RecentAlbum[]): void {
     if (al.thumb) {
       const img = document.createElement('img');
       img.className = 'disco-card-img';
-      img.src = al.thumb;
+      // Through the server (image cache / proxy, key attached), like the popup:
+      // raw Plex thumbs are relative or point at the media server's localhost.
+      img.src = serverArtwork(serverCfg!, al.thumb);
       img.alt = '';
       img.loading = 'lazy';
       img.addEventListener('error', () => {
@@ -408,7 +410,7 @@ function renderRecentlyAdded(albums: RecentAlbum[]): void {
 /** Fill in a missing album cover via the album's first track + Deezer. */
 async function hydrateAlbumArtwork(
   img: HTMLImageElement,
-  albumId: number,
+  albumId: string,
   albumTitle: string,
 ): Promise<void> {
   try {
@@ -422,7 +424,7 @@ async function hydrateAlbumArtwork(
 /** Replace a letter-placeholder div with the Deezer artwork when found. */
 async function hydrateAlbumArtworkDiv(
   ph: HTMLElement,
-  albumId: number,
+  albumId: string,
   albumTitle: string,
 ): Promise<void> {
   try {
@@ -468,16 +470,16 @@ async function loadRecentlyPlayed(): Promise<void> {
       const tracks = await getRecentlyPlayed(serverCfg, 20);
       if (tracks.length > 0) {
         const entries: QueueEntry[] = tracks
-          .filter((t) => t.id > 0 && t.filePath && !isUnplayableAudio(t.filePath))
+          .filter((t) => t.filePath && !isUnplayableAudio(t.filePath))
           .map((t) => {
             const e: QueueEntry = {
               kind: 'audio',
               title: t.title,
               subtitle: [t.artist, t.album].filter(Boolean).join(' · ') || undefined,
-              trackId: t.id,
+              trackId: t.id || undefined,
               audioPath: t.filePath,
             };
-            if (t.thumb) e.artworkUrl = t.thumb;
+            if (t.thumb) e.artworkUrl = serverArtwork(serverCfg!, t.thumb);
             enrichQueueArtwork(e);
             return e;
           });
@@ -537,8 +539,8 @@ function renderRecentlyPlayed(entries: QueueEntry[]): void {
 }
 
 /** Play an album: first track now, the rest queued behind it. */
-async function playAlbum(albumId: number): Promise<void> {
-  if (!serverCfg) return;
+async function playAlbum(albumId: string): Promise<void> {
+  if (!serverCfg || !albumId) return;
   try {
     const tracks = await getAlbumTracks(serverCfg, albumId);
     if (!tracks.length) {
@@ -753,7 +755,7 @@ async function playArtistRadio(artistName: string): Promise<void> {
     const playable: LibraryTrack[] = [];
     if (match) {
       const albums = await getArtistAlbums(serverCfg, match.id).catch(() => []);
-      const seen = new Set<number>();
+      const seen = new Set<string>();
       for (const al of albums.slice(0, 4)) {
         const tracks = await getAlbumTracks(serverCfg, al.id).catch(() => [] as LibraryTrack[]);
         for (const t of tracks) {
@@ -1084,7 +1086,7 @@ async function runPanelSearch(q: string): Promise<void> {
     if (reqId !== panelSearchReqId) return;
 
     // Merge tracks, dedupe.
-    const seen = new Set<number>();
+    const seen = new Set<string>();
     const tracks: LibraryTrack[] = [];
     for (const t of [...tracksByTitle, ...tracksByArtist]) {
       if (!seen.has(t.id)) {

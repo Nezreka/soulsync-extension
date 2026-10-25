@@ -1,6 +1,8 @@
 import browser from 'webextension-polyfill';
 import type { ReleaseInfo, ServerConfig } from './types.js';
-import { mapLibraryTrack, type LibraryTrack } from './player-api.js';
+import { libraryId, mapLibraryTrack, type LibraryId, type LibraryTrack } from './player-api.js';
+import { serverFetch } from './http.js';
+import { splitArtists } from './youtube.js';
 
 /**
  * SoulSync server client.
@@ -37,7 +39,7 @@ function baseUrl(cfg: ServerConfig): string {
 
 /** Fetch the v1 envelope without unwrapping it; throw on transport or API errors. */
 async function apiFetchEnvelope(cfg: ServerConfig, path: string, init: RequestInit = {}): Promise<Envelope> {
-  const res = await fetch(baseUrl(cfg) + path, {
+  const res = await serverFetch(baseUrl(cfg) + path, {
     ...init,
     headers: {
       'Content-Type': 'application/json',
@@ -88,7 +90,41 @@ export async function testConnection(cfg: ServerConfig): Promise<string> {
   const granted = await browser.permissions.request({ origins: [origin] });
   if (!granted) throw new Error('Permission to reach your server was not granted.');
   await apiFetch(cfg, `${V1}/playlists`, { method: 'GET' });
+  if ((await apiKeyScope(cfg)) === 'read') {
+    throw new Error(
+      'This API key is read-only. Companion searches, wishlists and watches, so it needs a full ' +
+        '(admin) key — create one on your SoulSync Settings page.',
+    );
+  }
   return 'Connected — the server answered with your API key.';
+}
+
+/**
+ * Which kind of key this is. SoulSync mints "admin" and "read" keys; a read
+ * key passes every GET under /api/v1 (so the connection test above succeeds)
+ * but the server's scope gate (api/auth.py enforce_read_key_scope) refuses
+ * every POST and every non-v1 route with 403 INSUFFICIENT_SCOPE — search,
+ * wishlist, watchlist, artwork. Probed with a harmless watchlist check; an
+ * answer we can't classify is 'unknown', never a false alarm.
+ */
+export async function apiKeyScope(cfg: ServerConfig): Promise<'admin' | 'read' | 'unknown'> {
+  try {
+    const res = await serverFetch(
+      `${baseUrl(cfg)}/api/watchlist/check?api_key=${encodeURIComponent(cfg.apiKey)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ artist_id: 'companion-scope-probe' }),
+      },
+    );
+    if (res.status === 403) {
+      const body = (await res.json().catch(() => null)) as { error?: { code?: unknown } } | null;
+      if (body?.error?.code === 'INSUFFICIENT_SCOPE') return 'read';
+    }
+    return res.ok ? 'admin' : 'unknown';
+  } catch {
+    return 'unknown';
+  }
 }
 
 export interface TrackHit {
@@ -267,16 +303,51 @@ export async function addToWishlist(
   return wishlistTrack(cfg, best);
 }
 
+export interface ReleaseWishlistResult {
+  /** Tracks that landed on the wishlist (new or updated). */
+  added: number;
+  /** Tracks that couldn't be wishlisted, with the reason — never dropped silently. */
+  failed: { title: string; error: string }[];
+}
+
 /** Wishlist every track of a page-aware release. Each track is resolved via
  *  the server's automatic metadata source (source:'auto'); release.source is
- *  provenance only and never steers the lookup. */
-export async function wishlistRelease(cfg: ServerConfig, release: ReleaseInfo): Promise<number> {
-  let n = 0;
-  for (const title of release.tracks) {
-    await addToWishlist(cfg, { artist: release.artist, title, album: release.title });
-    n++;
+ *  provenance only and never steers the lookup. One unmatched track no longer
+ *  stops the rest: every track is tried and the misses come back by name. A
+ *  release where nothing at all landed throws, so callers never report a
+ *  hollow success. */
+export async function wishlistRelease(
+  cfg: ServerConfig,
+  release: ReleaseInfo,
+): Promise<ReleaseWishlistResult> {
+  if (release.tracks.length === 0) {
+    throw new Error("No tracklist found on this page — nothing to wishlist.");
   }
-  return n;
+  const out: ReleaseWishlistResult = { added: 0, failed: [] };
+  for (const title of release.tracks) {
+    try {
+      await addToWishlist(cfg, { artist: release.artist, title, album: release.title });
+      out.added++;
+    } catch (e) {
+      out.failed.push({ title, error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+  if (out.added === 0) {
+    throw new Error(
+      `None of the ${release.tracks.length} tracks could be wishlisted: ${out.failed[0]?.error ?? 'unknown error'}`,
+    );
+  }
+  return out;
+}
+
+/** "12 tracks", or "10 of 12 tracks (missed: A, B)" — for status lines. */
+export function describeReleaseResult(r: ReleaseWishlistResult): string {
+  const total = r.added + r.failed.length;
+  const noun = `track${total === 1 ? '' : 's'}`;
+  if (r.failed.length === 0) return `${r.added} ${noun}`;
+  const names = r.failed.slice(0, 3).map((f) => f.title).join(', ');
+  const more = r.failed.length > 3 ? ` +${r.failed.length - 3} more` : '';
+  return `${r.added} of ${total} ${noun} (no match: ${names}${more})`;
 }
 
 /** Providers the library lookup endpoint accepts (api/library.py). */
@@ -423,7 +494,7 @@ export async function lookupLibraryTrackSmart(
       artist: artist.slice(0, 200),
       limit: '25',
     });
-    const res = await fetch(`${base}${V1}/library/tracks?${params}`, {
+    const res = await serverFetch(`${base}${V1}/library/tracks?${params}`, {
       headers: { Authorization: `Bearer ${cfg.apiKey}` },
     });
     if (!res.ok) return null;
@@ -442,7 +513,7 @@ export async function lookupLibraryTrackSmart(
 /** Remove a track from the wishlist by its provider id. 404 = already gone. */
 export async function removeFromWishlist(cfg: ServerConfig, trackId: string): Promise<void> {
   const url = `${cfg.url.replace(/\/+$/, '')}${V1}/wishlist/${encodeURIComponent(trackId)}`;
-  const res = await fetch(url, {
+  const res = await serverFetch(url, {
     method: 'DELETE',
     headers: { Authorization: `Bearer ${cfg.apiKey}` },
   });
@@ -499,13 +570,95 @@ export function normName(s: string): string {
 }
 
 /**
- * Session cache: badgeKey -> in-library (true/false). Nulls (unverifiable)
- * are never cached — a transient failure may succeed on the next scan.
+ * Badge result cache: badgeKey -> in-library (true/false). Nulls
+ * (unverifiable) are never cached — a transient failure may succeed on the
+ * next scan. Entries expire so a wishlisted track that lands in the library
+ * flips its pill without a browser restart.
  */
-const badgeCache = new Map<string, boolean>();
+const BADGE_CACHE_TTL_MS = 5 * 60_000;
+const badgeCache = new Map<string, { v: boolean; at: number }>();
+
+function cacheGet(key: string): boolean | undefined {
+  const hit = badgeCache.get(key);
+  if (!hit) return undefined;
+  if (Date.now() - hit.at > BADGE_CACHE_TTL_MS) {
+    badgeCache.delete(key);
+    return undefined;
+  }
+  return hit.v;
+}
+
+function cacheSet(key: string, v: boolean): void {
+  badgeCache.set(key, { v, at: Date.now() });
+}
+
+/** Forget cached badge verdicts (after a wishlist/watch action, or in tests). */
+export function clearBadgeCache(): void {
+  badgeCache.clear();
+  artistIdCache.clear();
+  artistAlbumsCache.clear();
+}
 
 function badgeKey(kind: string, name: string, artist?: string): string {
   return `${kind}:${normName(artist ? `${artist} ${name}` : name)}`;
+}
+
+/**
+ * One in-flight request per key: a page that names the same artist on ten
+ * cards makes one server call, not ten. Settled promises are cached for the
+ * badge TTL; failures are dropped so the next scan retries.
+ */
+function memoized<T>(
+  cache: Map<string, { p: Promise<T>; at: number }>,
+  key: string,
+  load: () => Promise<T>,
+  keep: (v: T) => boolean,
+): Promise<T> {
+  const hit = cache.get(key);
+  if (hit && Date.now() - hit.at <= BADGE_CACHE_TTL_MS) return hit.p;
+  const p = load();
+  cache.set(key, { p, at: Date.now() });
+  p.then(
+    (v) => {
+      if (!keep(v)) cache.delete(key);
+    },
+    () => cache.delete(key),
+  );
+  return p;
+}
+
+const artistIdCache = new Map<string, { p: Promise<LibraryId | false | null>; at: number }>();
+
+/**
+ * Resolve a library artist id for an exact normalized name match.
+ * Returns the id, `false` when the artist is absent, `null` on server error.
+ */
+function libraryArtistId(cfg: ServerConfig, name: string): Promise<LibraryId | false | null> {
+  const want = normName(name);
+  if (want.length === 0) return Promise.resolve(null);
+  return memoized(
+    artistIdCache,
+    want,
+    async () => {
+      try {
+        const data = await apiFetch(
+          cfg,
+          `${V1}/library/artists?search=${encodeURIComponent(name)}&limit=5`,
+          { method: 'GET' },
+        );
+        const artists = data.artists;
+        if (!Array.isArray(artists)) return null;
+        const hit = artists.find((a: unknown) => {
+          const n = (a as { name?: unknown }).name;
+          return typeof n === 'string' && normName(n) === want;
+        }) as { id?: unknown } | undefined;
+        return (hit && libraryId(hit.id)) || false;
+      } catch {
+        return null;
+      }
+    },
+    (v) => v !== null,
+  );
 }
 
 /**
@@ -516,79 +669,65 @@ function badgeKey(kind: string, name: string, artist?: string): string {
  */
 async function libraryHasArtist(cfg: ServerConfig, name: string): Promise<boolean | null> {
   const key = badgeKey('artist', name);
-  const cached = badgeCache.get(key);
+  const cached = cacheGet(key);
   if (cached !== undefined) return cached;
-  const want = normName(name);
-  if (want.length === 0) return null;
-  try {
-    const data = await apiFetch(cfg, `${V1}/library/artists?search=${encodeURIComponent(name)}&limit=5`, {
-      method: 'GET',
-    });
-    const artists = data.artists;
-    const found =
-      Array.isArray(artists) &&
-      artists.some((a: unknown) => {
-        const n = (a as { name?: unknown }).name;
-        return typeof n === 'string' && normName(n) === want;
-      });
-    badgeCache.set(key, found);
-    return found;
-  } catch {
-    return null;
-  }
+  const id = await libraryArtistId(cfg, name);
+  if (id === null) return null;
+  const found = id !== false;
+  cacheSet(key, found);
+  return found;
 }
 
+const artistAlbumsCache = new Map<
+  string,
+  { p: Promise<{ id: LibraryId; title: string }[]>; at: number }
+>();
+
 /**
- * Resolve a library artist id for an exact normalized name match.
- * Returns the id, `false` when the artist is absent, `null` on server error.
+ * Every library album of one artist, fetched once and matched locally — an
+ * artist page with twenty album cards costs one call instead of twenty
+ * title searches against the rate-limited API. Throws on transport errors.
  */
-async function libraryArtistId(cfg: ServerConfig, name: string): Promise<number | false | null> {
-  const want = normName(name);
-  if (want.length === 0) return null;
-  try {
-    const data = await apiFetch(cfg, `${V1}/library/artists?search=${encodeURIComponent(name)}&limit=5`, {
-      method: 'GET',
-    });
-    const artists = data.artists;
-    if (!Array.isArray(artists)) return null;
-    const hit = artists.find((a: unknown) => {
-      const n = (a as { name?: unknown }).name;
-      return typeof n === 'string' && normName(n) === want;
-    }) as { id?: unknown } | undefined;
-    const id = hit ? Number(hit.id) : NaN;
-    return Number.isFinite(id) ? id : false;
-  } catch {
-    return null;
-  }
+function libraryArtistAlbums(
+  cfg: ServerConfig,
+  artistId: LibraryId,
+): Promise<{ id: LibraryId; title: string }[]> {
+  return memoized(
+    artistAlbumsCache,
+    artistId,
+    async () => {
+      const data = await apiFetch(
+        cfg,
+        `${V1}/library/artists/${encodeURIComponent(artistId)}/albums?fields=id,title`,
+        { method: 'GET' },
+      );
+      const albums = Array.isArray(data.albums) ? data.albums : [];
+      const out: { id: LibraryId; title: string }[] = [];
+      for (const a of albums) {
+        const o = a as { title?: unknown; id?: unknown };
+        const id = libraryId(o.id);
+        if (id !== null && typeof o.title === 'string') out.push({ id, title: o.title });
+      }
+      return out;
+    },
+    () => true,
+  );
 }
 
 /**
  * The library album id for an exact title under a library artist id.
- * null = no exact match (or unresolvable) — never throws for "absent",
- * throws on transport errors so callers keep the tri-state.
+ * null = no exact match — never throws for "absent", throws on transport
+ * errors so callers keep the tri-state.
  */
 async function libraryAlbumId(
   cfg: ServerConfig,
-  artistId: number,
+  artistId: LibraryId,
   title: string,
-): Promise<number | null> {
+): Promise<LibraryId | null> {
   const wantTitle = normName(title);
   if (wantTitle.length === 0) return null;
-  const data = await apiFetch(
-    cfg,
-    `${V1}/library/albums?search=${encodeURIComponent(title)}&artist_id=${artistId}&limit=10`,
-    { method: 'GET' },
-  );
-  const albums = data.albums;
-  if (!Array.isArray(albums)) return null;
-  for (const a of albums) {
-    const o = a as { title?: unknown; id?: unknown };
-    if (typeof o.title === 'string' && normName(o.title) === wantTitle) {
-      const id = Number(o.id);
-      if (Number.isFinite(id)) return id;
-    }
-  }
-  return null;
+  const albums = await libraryArtistAlbums(cfg, artistId);
+  return albums.find((a) => normName(a.title) === wantTitle)?.id ?? null;
 }
 
 /**
@@ -603,7 +742,7 @@ async function libraryHasAlbum(
   artist?: string,
 ): Promise<boolean | null> {
   const key = badgeKey('album', title, artist);
-  const cached = badgeCache.get(key);
+  const cached = cacheGet(key);
   if (cached !== undefined) return cached;
   const wantTitle = normName(title);
   if (wantTitle.length === 0 || normName(artist ?? '').length === 0) return null;
@@ -612,14 +751,74 @@ async function libraryHasAlbum(
     if (artistId === null) return null; // server error — unknown, not absent
     if (artistId === false) {
       // Artist isn't in the library, so their album can't be either.
-      badgeCache.set(key, false);
+      cacheSet(key, false);
       return false;
     }
     const found = (await libraryAlbumId(cfg, artistId, title)) !== null;
-    badgeCache.set(key, found);
+    cacheSet(key, found);
     return found;
   } catch {
     return null;
+  }
+}
+
+/* ── batched track ownership (/api/library/check-tracks) ── */
+
+/** How long track checks for the same artist gather before one request goes out. */
+const OWNED_BATCH_MS = 60;
+
+interface OwnedBatch {
+  artist: string;
+  titles: Map<string, Array<(v: boolean | null) => void>>;
+}
+const ownedBatches = new Map<string, OwnedBatch>();
+
+/**
+ * Is this track owned, per the server's own ownership check? Track checks
+ * for one artist are coalesced into a single POST /api/library/check-tracks
+ * — the batch matcher SoulSync's web UI uses (one DB query per artist, the
+ * server's title cleaning and per-artist filtering) and, being a non-v1
+ * route, outside the 60/minute API limit. true/false = the server's verdict,
+ * null = the endpoint failed or is missing (older server): fall back.
+ */
+function checkTrackOwned(cfg: ServerConfig, artist: string, title: string): Promise<boolean | null> {
+  const key = normName(artist);
+  return new Promise((resolve) => {
+    let batch = ownedBatches.get(key);
+    if (!batch) {
+      const fresh: OwnedBatch = { artist, titles: new Map() };
+      batch = fresh;
+      ownedBatches.set(key, fresh);
+      setTimeout(() => {
+        ownedBatches.delete(key);
+        void flushOwnedBatch(cfg, fresh);
+      }, OWNED_BATCH_MS);
+    }
+    const waiters = batch.titles.get(title) ?? [];
+    waiters.push(resolve);
+    batch.titles.set(title, waiters);
+  });
+}
+
+async function flushOwnedBatch(cfg: ServerConfig, batch: OwnedBatch): Promise<void> {
+  let owned: Record<string, unknown> | null = null;
+  try {
+    const data = await nonV1Fetch(cfg, '/api/library/check-tracks', {
+      method: 'POST',
+      body: JSON.stringify({
+        artist_name: batch.artist,
+        tracks: [...batch.titles.keys()].map((name) => ({ name })),
+      }),
+    });
+    const o = data.owned_tracks;
+    owned = o && typeof o === 'object' ? (o as Record<string, unknown>) : null;
+  } catch {
+    owned = null;
+  }
+  for (const [title, waiters] of batch.titles) {
+    const row = owned?.[title] as { owned?: unknown } | undefined;
+    const v = typeof row?.owned === 'boolean' ? row.owned : null;
+    for (const w of waiters) w(v);
   }
 }
 
@@ -649,31 +848,29 @@ export async function resolveLibraryLink(
       : { url: `${origin}/library?view=albums&q=${encodeURIComponent(name)}`, exact: false };
   if (normName(name).length === 0) return { url: '', exact: false };
   try {
+    const artistPage = (id: LibraryId): string =>
+      `${origin}/artist-detail/library/${encodeURIComponent(id)}`;
+    const albumParam = (id: LibraryId): string => `?album=${encodeURIComponent(id)}`;
     if (kind === 'artist') {
       const id = await libraryArtistId(cfg, name);
-      if (typeof id === 'number')
-        return { url: `${origin}/artist-detail/library/${id}`, exact: true };
+      if (id) return { url: artistPage(id), exact: true };
     } else if (kind === 'album' && artist && normName(artist).length > 0) {
       const artistId = await libraryArtistId(cfg, artist);
-      if (typeof artistId === 'number') {
+      if (artistId) {
         const albumId = await libraryAlbumId(cfg, artistId, name);
-        const base = `${origin}/artist-detail/library/${artistId}`;
+        const base = artistPage(artistId);
         return albumId !== null
-          ? { url: `${base}?album=${albumId}`, exact: true }
+          ? { url: base + albumParam(albumId), exact: true }
           : { url: base, exact: false };
       }
     } else if (kind === 'track' && artist && normName(artist).length > 0) {
       const rec = await resolveLibraryTrackRecord(cfg, artist, name);
-      if (rec && typeof rec.artist_id === 'number') {
-        const base = `${origin}/artist-detail/library/${rec.artist_id}`;
-        return {
-          url: typeof rec.album_id === 'number' ? `${base}?album=${rec.album_id}` : base,
-          exact: true,
-        };
+      if (rec && rec.artist_id) {
+        const base = artistPage(rec.artist_id);
+        return { url: rec.album_id ? base + albumParam(rec.album_id) : base, exact: true };
       }
       const artistId = await libraryArtistId(cfg, artist);
-      if (typeof artistId === 'number')
-        return { url: `${origin}/artist-detail/library/${artistId}`, exact: false };
+      if (artistId) return { url: artistPage(artistId), exact: false };
     }
   } catch {
     /* fall through to the filtered grid */
@@ -723,11 +920,14 @@ export async function lookupBadgeStatuses(
 }
 
 /**
- * Is "artist - title" in the library? Resolves the bare metadata through
- * the server's own track search, then checks the best hit's provider id —
- * the same two calls the popup's per-row library state uses. Tri-state:
- * true = the resolved track is in the library, false = resolved but
- * absent, null = couldn't resolve or couldn't check.
+ * Is "artist - title" in the library? First the server's batched ownership
+ * check (one request per artist, not rate-limited). Its "not owned" is
+ * trusted for a single-artist credit; a multi-artist credit ("A & B") may
+ * not be filed under that exact string, so it — like an older server
+ * without the batch route — falls back to the per-track path: resolve
+ * through the server's own track search, then the exact provider-ID lookup
+ * and the strict title+artist library search. Tri-state: true = in library,
+ * false = verified absent, null = couldn't check.
  */
 async function libraryHasTrack(
   cfg: ServerConfig,
@@ -735,23 +935,20 @@ async function libraryHasTrack(
   artist: string,
 ): Promise<boolean | null> {
   const key = badgeKey('track', title, artist);
-  const cached = badgeCache.get(key);
+  const cached = cacheGet(key);
   if (cached !== undefined) return cached;
   if (normName(title).length === 0 || normName(artist).length === 0) return null;
+  const owned = await checkTrackOwned(cfg, artist, title);
+  if (owned === true || (owned === false && splitArtists(artist).length <= 1)) {
+    cacheSet(key, owned);
+    return owned;
+  }
   try {
     const { tracks: hits, source } = await searchTracks(cfg, `${artist} - ${title}`, 5);
     const best = pickBest(hits, { artist, title });
-    // Smart check: exact provider-ID first, then title+artist library search.
-    // Catches the same song filed under a different release (single vs album).
-    const inLibrary = await lookupLibraryTrackSmart(
-      cfg,
-      source,
-      best?.id ?? '',
-      title,
-      artist,
-    );
+    const inLibrary = await lookupLibraryTrackSmart(cfg, source, best?.id ?? '', title, artist);
     if (inLibrary === null) return null;
-    badgeCache.set(key, inLibrary);
+    cacheSet(key, inLibrary);
     return inLibrary;
   } catch {
     return null;
@@ -769,9 +966,9 @@ export interface ArtistHit {
 
 /** A library track row as returned by /api/v1/library/lookup (subset we use). */
 export interface LibraryTrackRecord {
-  id: number;
-  album_id: number | null;
-  artist_id: number | null;
+  id: LibraryId;
+  album_id: LibraryId | null;
+  artist_id: LibraryId | null;
   title: string;
 }
 
@@ -789,7 +986,7 @@ export async function lookupLibraryTrackRecord(
   const url =
     `${cfg.url.replace(/\/+$/, '')}${V1}/library/lookup?type=track` +
     `&provider=${encodeURIComponent(provider)}&id=${encodeURIComponent(id)}`;
-  const res = await fetch(url, { headers: { Authorization: `Bearer ${cfg.apiKey}` } });
+  const res = await serverFetch(url, { headers: { Authorization: `Bearer ${cfg.apiKey}` } });
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`library lookup failed: ${res.status}`);
   const envelope = (await res.json().catch(() => ({}))) as {
@@ -797,12 +994,14 @@ export async function lookupLibraryTrackRecord(
     data?: { track?: Record<string, unknown> };
   };
   const t = envelope.success === true ? envelope.data?.track : undefined;
-  if (!t || typeof t.id !== 'number') return null;
-  const num = (v: unknown): number | null => (typeof v === 'number' ? v : null);
+  // Ids are TEXT server-side ("142795", hex GUIDs, "…::soulsync") — a
+  // numbers-only check here reported every library track as absent.
+  const rowId = t ? libraryId(t.id) : null;
+  if (!t || rowId === null) return null;
   return {
-    id: t.id,
-    album_id: num(t.album_id),
-    artist_id: num(t.artist_id),
+    id: rowId,
+    album_id: libraryId(t.album_id),
+    artist_id: libraryId(t.artist_id),
     title: typeof t.title === 'string' ? t.title : '',
   };
 }
@@ -852,7 +1051,7 @@ export async function watchArtist(
   const url = `${base}/api/watchlist/add?api_key=${encodeURIComponent(cfg.apiKey)}`;
   const body: Record<string, string> = { artist_id: artistId, artist_name: artistName };
   if (source) body.source = source;
-  const res = await fetch(url, {
+  const res = await serverFetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -870,7 +1069,7 @@ export async function watchArtist(
 export async function unwatchArtist(cfg: ServerConfig, artistId: string): Promise<void> {
   const base = cfg.url.replace(/\/+$/, '');
   const url = `${base}/api/watchlist/remove?api_key=${encodeURIComponent(cfg.apiKey)}`;
-  const res = await fetch(url, {
+  const res = await serverFetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ artist_id: artistId }),
@@ -893,7 +1092,7 @@ export async function checkWatchlist(
   const base = cfg.url.replace(/\/+$/, '');
   const url = `${base}/api/watchlist/check?api_key=${encodeURIComponent(cfg.apiKey)}`;
   try {
-    const res = await fetch(url, {
+    const res = await serverFetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ artist_id: artistId }),
@@ -991,7 +1190,7 @@ export async function getVideoStats(cfg: ServerConfig): Promise<VideoStats> {
 }
 
 export interface RecentAlbum {
-  id: number;
+  id: LibraryId;
   title: string;
   year: number | null;
   thumb: string;
@@ -1010,7 +1209,7 @@ export async function getRecentlyAdded(cfg: ServerConfig, limit = 12): Promise<R
   return items.map((it: unknown) => {
     const o = it as Record<string, unknown>;
     return {
-      id: typeof o.id === 'number' ? o.id : 0,
+      id: libraryId(o.id) ?? '',
       title: typeof o.title === 'string' ? o.title : 'Untitled',
       year: typeof o.year === 'number' ? o.year : null,
       thumb: typeof o.thumb_url === 'string' ? o.thumb_url : '',
@@ -1020,7 +1219,7 @@ export async function getRecentlyAdded(cfg: ServerConfig, limit = 12): Promise<R
 }
 
 export interface RecentTrack {
-  id: number;
+  id: LibraryId;
   title: string;
   artist: string;
   album: string;
@@ -1041,7 +1240,7 @@ export async function getRecentlyPlayed(cfg: ServerConfig, limit = 20): Promise<
   return tracks.map((it: unknown) => {
     const o = it as Record<string, unknown>;
     return {
-      id: typeof o.id === 'number' ? o.id : 0,
+      id: libraryId(o.id) ?? '',
       title: typeof o.title === 'string' ? o.title : 'Untitled',
       artist: typeof o.artist_name === 'string' ? o.artist_name : '',
       album: typeof o.album_title === 'string' ? o.album_title : '',
@@ -1600,7 +1799,7 @@ export async function nonV1Fetch(
   const base = cfg.url.replace(/\/+$/, '');
   const sep = path.includes('?') ? '&' : '?';
   const url = `${base}${path}${sep}api_key=${encodeURIComponent(cfg.apiKey)}`;
-  const res = await fetch(url, {
+  const res = await serverFetch(url, {
     ...init,
     headers: { 'Content-Type': 'application/json', ...(init.headers || {}) },
   });
@@ -1751,7 +1950,7 @@ export async function getDeezerPlaylistTracks(
     throw new Error(typeof err === 'string' && err ? err : `Server returned ${res.status}`);
   };
 
-  const first = await fetch(url(''));
+  const first = await serverFetch(url(''));
   if (first.status !== 202) {
     const data = await readJson(first);
     if (!first.ok) throwFor(first, data);
@@ -1761,7 +1960,7 @@ export async function getDeezerPlaylistTracks(
   let job = await readJson(first);
   let jobId = typeof job.job_id === 'string' ? job.job_id : '';
   if (!jobId) {
-    const started = await fetch(url('?async=1'));
+    const started = await serverFetch(url('?async=1'));
     job = await readJson(started);
     jobId = typeof job.job_id === 'string' ? job.job_id : '';
   }
@@ -1769,7 +1968,7 @@ export async function getDeezerPlaylistTracks(
   // …and poll until it lands.
   for (let i = 0; i < 90; i++) {
     await sleep(2000);
-    const pr = await fetch(`${base}/api/deezer/playlist-load/${encodeURIComponent(jobId)}?${key}`);
+    const pr = await serverFetch(`${base}/api/deezer/playlist-load/${encodeURIComponent(jobId)}?${key}`);
     if (pr.status === 202) continue;
     const pd = await readJson(pr);
     if (!pr.ok) throwFor(pr, pd);

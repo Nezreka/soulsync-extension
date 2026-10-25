@@ -1,4 +1,5 @@
 import type { ServerConfig } from './types.js';
+import { serverFetch } from './http.js';
 
 /**
  * Player server API — library listing and stream URL builders for the
@@ -41,7 +42,7 @@ interface Envelope {
 
 /** Fetch a v1 route and unwrap the {success, data} envelope; throw on error. */
 async function apiFetch(cfg: ServerConfig, path: string, init: RequestInit = {}): Promise<Record<string, unknown>> {
-  const res = await fetch(baseUrl(cfg) + path, {
+  const res = await serverFetch(baseUrl(cfg) + path, {
     ...init,
     headers: {
       'Content-Type': 'application/json',
@@ -60,16 +61,32 @@ async function apiFetch(cfg: ServerConfig, path: string, init: RequestInit = {})
 
 /* ── types ── */
 
+/**
+ * A music-library row id. The server stores artist/album/track ids as TEXT
+ * (database/music_database.py::_migrate_id_columns_to_text): Plex ids arrive
+ * as numeric strings ("142795"), Jellyfin as hex GUIDs, Navidrome as opaque
+ * slugs, and SoulSync-standalone rows as "<hash>::soulsync". Never parse one
+ * as a number: parseInt("369dcf…") is 369 — a different album.
+ */
+export type LibraryId = string;
+
+/** A library id from a server row: numbers and non-empty strings, else null. */
+export function libraryId(v: unknown): LibraryId | null {
+  if (typeof v === 'number' && Number.isFinite(v)) return String(v);
+  if (typeof v === 'string' && v.trim()) return v.trim();
+  return null;
+}
+
 /** One music-library track as the player sees it. */
 export interface LibraryTrack {
-  id: number;
+  id: LibraryId;
   title: string;
   artist: string;
   album: string;
   /** Library artist id (for artist radio from search results). */
-  artistId: number | null;
+  artistId: LibraryId | null;
   /** Library album id (for album play from search results). */
-  albumId: number | null;
+  albumId: LibraryId | null;
   /** Server-side path used as the stream's ?path= param. */
   filePath: string;
   /** Track length in seconds (server stores ms); null when unknown. */
@@ -110,7 +127,7 @@ export interface PlayerQueueEntry {
   subtitle: string;
   artworkUrl?: string;
   audioPath?: string;
-  trackId?: number;
+  trackId?: LibraryId;
   videoKd?: 'm' | 't';
   videoId?: number;
   season?: number;
@@ -124,7 +141,7 @@ export interface PlayerQueueEntry {
  * Map one serialize_track row to a LibraryTrack, defensively.
  *
  * Field grounding (api/serializers.py::serialize_track, verified Oct 2 2026):
- * - `id`            → LibraryTrack.id (number)
+ * - `id`            → LibraryTrack.id (TEXT on the server — see LibraryId)
  * - `title`         → LibraryTrack.title
  * - `file_path`     → LibraryTrack.filePath
  * - `duration`      → LibraryTrack.durationSec, /1000 — the tracks table
@@ -166,12 +183,12 @@ export function mapLibraryTrack(raw: unknown): LibraryTrack {
 
   const durationMs = num(o.duration);
   return {
-    id: num(o.id) ?? 0,
+    id: libraryId(o.id) ?? '',
     title: str(o.title),
     artist,
     album,
-    artistId: num(o.artist_id),
-    albumId: num(o.album_id),
+    artistId: libraryId(o.artist_id),
+    albumId: libraryId(o.album_id),
     filePath: str(o.file_path),
     durationSec:
       durationMs !== null && durationMs >= 0 ? Math.round(durationMs / 1000) : null,
@@ -215,7 +232,7 @@ export async function searchLibraryTracks(
  * Contract: GET /api/v1/library/albums/<album_id>/tracks
  * (api/library.py::get_album_tracks, require_api_key) → {tracks: [...]}.
  */
-export async function getAlbumTracks(cfg: ServerConfig, albumId: number): Promise<LibraryTrack[]> {
+export async function getAlbumTracks(cfg: ServerConfig, albumId: LibraryId): Promise<LibraryTrack[]> {
   const data = await apiFetch(
     cfg,
     `${V1}/library/albums/${encodeURIComponent(String(albumId))}/tracks`,
@@ -227,7 +244,7 @@ export async function getAlbumTracks(cfg: ServerConfig, albumId: number): Promis
 }
 
 export interface LibraryAlbum {
-  id: number;
+  id: LibraryId;
   title: string;
   artist?: string;
   year?: number | null;
@@ -259,7 +276,7 @@ export async function searchLibraryAlbums(
     const num = (v: unknown): number | null =>
       typeof v === 'number' && Number.isFinite(v) ? v : null;
     return {
-      id: num(o.id) ?? 0,
+      id: libraryId(o.id) ?? '',
       title: str(o.title),
       artist: str(o.artist_name),
       year: num(o.year),
@@ -269,7 +286,7 @@ export async function searchLibraryAlbums(
 }
 
 export interface LibraryArtist {
-  id: number;
+  id: LibraryId;
   name: string;
 }
 
@@ -294,16 +311,11 @@ export async function searchLibraryArtists(
   const out: LibraryArtist[] = [];
   for (const a of artists) {
     const o = (a ?? {}) as Record<string, unknown>;
-    const idNum = typeof o.id === 'number' ? o.id : typeof o.id === 'string' ? parseInt(o.id, 10) : NaN;
-    if (!Number.isFinite(idNum) || typeof o.name !== 'string') continue;
-    out.push({ id: idNum, name: o.name });
+    const id = libraryId(o.id);
+    if (id === null || typeof o.name !== 'string') continue;
+    out.push({ id, name: o.name });
   }
   return out;
-}
-
-export interface LibraryAlbum {
-  id: number;
-  title: string;
 }
 
 /**
@@ -312,7 +324,7 @@ export interface LibraryAlbum {
  * Contract: GET /api/v1/library/artists/<artist_id>/albums
  * (api/library.py::get_artist_albums, require_api_key) → {albums: [{id, title, …}]}.
  */
-export async function getArtistAlbums(cfg: ServerConfig, artistId: number): Promise<LibraryAlbum[]> {
+export async function getArtistAlbums(cfg: ServerConfig, artistId: LibraryId): Promise<LibraryAlbum[]> {
   const data = await apiFetch(
     cfg,
     `${V1}/library/artists/${encodeURIComponent(String(artistId))}/albums`,
@@ -323,9 +335,9 @@ export async function getArtistAlbums(cfg: ServerConfig, artistId: number): Prom
   const out: LibraryAlbum[] = [];
   for (const a of albums) {
     const o = (a ?? {}) as Record<string, unknown>;
-    const idNum = typeof o.id === 'number' ? o.id : typeof o.id === 'string' ? parseInt(o.id, 10) : NaN;
-    if (!Number.isFinite(idNum) || typeof o.title !== 'string') continue;
-    out.push({ id: idNum, title: o.title });
+    const id = libraryId(o.id);
+    if (id === null || typeof o.title !== 'string') continue;
+    out.push({ id, title: o.title });
   }
   return out;
 }
@@ -340,7 +352,7 @@ function keyParam(cfg: ServerConfig): string {
 export interface AudioStreamEntry {
   audioPath?: string;
   /** Server library track id — engages the Navidrome/Subsonic proxy fallback. */
-  trackId?: number;
+  trackId?: LibraryId | number;
 }
 
 /**
@@ -358,7 +370,9 @@ export function libraryAudioUrl(cfg: ServerConfig, entry: AudioStreamEntry): str
     throw new Error('Cannot stream audio: the track has no file path.');
   }
   const base = `${baseUrl(cfg)}/stream/library-audio?path=${encodeURIComponent(entry.audioPath)}&${keyParam(cfg)}`;
-  return entry.trackId !== undefined ? `${base}&track_id=${encodeURIComponent(String(entry.trackId))}` : base;
+  return entry.trackId !== undefined && entry.trackId !== ''
+    ? `${base}&track_id=${encodeURIComponent(String(entry.trackId))}`
+    : base;
 }
 
 /** Shared query builder for the two /api/video/watch/* endpoints. */
@@ -423,7 +437,7 @@ const NO_VERDICT: PlayableVerdict = {
 export async function checkVideoPlayable(cfg: ServerConfig, entry: VideoEntry): Promise<PlayableVerdict> {
   let body: unknown;
   try {
-    const res = await fetch(videoPlayableUrl(cfg, entry));
+    const res = await serverFetch(videoPlayableUrl(cfg, entry));
     body = await res.json().catch(() => null);
     if (!res.ok && (body === null || typeof body !== 'object')) {
       return { ...NO_VERDICT, reasons: [`The server refused the playable check (${res.status})`] };
@@ -471,8 +485,8 @@ export function toQueueEntry(track: LibraryTrack): PlayerQueueEntry {
     title: track.title,
     subtitle: track.artist,
     audioPath: track.filePath,
-    trackId: track.id,
   };
+  if (track.id) entry.trackId = track.id;
   if (track.artworkUrl !== null) entry.artworkUrl = track.artworkUrl;
   if (track.durationSec !== null) entry.durationSec = track.durationSec;
   return entry;
@@ -510,7 +524,7 @@ export interface VideoLibraryEntry {
  * the api.ts convention; throws on non-ok like apiFetch.
  */
 async function videoApiFetch(cfg: ServerConfig, path: string): Promise<unknown> {
-  const res = await fetch(baseUrl(cfg) + path, {
+  const res = await serverFetch(baseUrl(cfg) + path, {
     headers: { Authorization: `Bearer ${cfg.apiKey}` },
   });
   const body: unknown = await res.json().catch(() => null);

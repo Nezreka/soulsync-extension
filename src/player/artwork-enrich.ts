@@ -11,7 +11,7 @@ import { sendToPlayer } from './messaging.js';
 import type { QueueEntry } from './types.js';
 
 /** trackIds with a lookup already running — never double-fetch. */
-const inFlight = new Set<number>();
+const inFlight = new Set<string>();
 
 export function enrichQueueArtwork(entry: QueueEntry): void {
   if (entry.kind !== 'audio' || entry.artworkUrl) return;

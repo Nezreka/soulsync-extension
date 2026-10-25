@@ -2148,8 +2148,22 @@ async function onWishlistAlbum(rec: BadgeRec, btn: HTMLButtonElement): Promise<v
     return;
   }
   actedKeys.add(badgeKeyFor(c));
-  closePopover(rec);
   const host = [...badges.entries()].find(([, r]) => r === rec)?.[0];
+  const missed = Array.isArray(done.failed) ? (done.failed as unknown[]).map(String) : [];
+  if (missed.length > 0 && rec.pop) {
+    // Partial: most tracks landed — say exactly which didn't, keep the card
+    // open so the user sees it, and don't offer a re-add of the whole album.
+    btn.textContent = `Added ${Number(done.tracks) || 0} of ${(Number(done.tracks) || 0) + missed.length}`;
+    const err = rec.pop.querySelector('.ssb-err');
+    if (err) {
+      err.textContent = `No match on your server for: ${missed.slice(0, 5).join(', ')}${
+        missed.length > 5 ? ` +${missed.length - 5} more` : ''
+      }`;
+      err.removeAttribute('hidden');
+    }
+  } else {
+    closePopover(rec);
+  }
   if (host) setPillState(host, 'acted');
 }
 

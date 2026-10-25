@@ -42,7 +42,7 @@ import {
   watchArtist,
   wishlistRelease,
 } from '../shared/api.js';
-import type { DeezerPlaylistTrack, SpotifyPlaylistTrack } from '../shared/api.js';
+import type { ArtistHit, DeezerPlaylistTrack, SpotifyPlaylistTrack } from '../shared/api.js';
 
 const MENU_ID = 'soulsync-send-selection';
 const PENDING_KEY = 'pendingSelection';
@@ -213,54 +213,47 @@ function asReleaseSource(provider: string | undefined): ReleaseSource | undefine
   return provider && RELEASE_SOURCES.has(provider) ? (provider as ReleaseSource) : undefined;
 }
 
-// Throttle badge checks: SoulSync rate-limits aggressive bursts from
-// card grids (music album/artist cards, video rec rails).
-const badgeCheckQueue: Array<() => void> = [];
-let badgeCheckRunning = false;
-async function throttledBadgeCheck<T>(fn: () => Promise<T>): Promise<T> {
-  return new Promise((resolve, reject) => {
-    badgeCheckQueue.push(async () => {
-      try {
-        resolve(await fn());
-      } catch (e) {
-        reject(e);
-      }
-    });
-    void drainBadgeCheckQueue();
-  });
+// Serialize badge checks from card grids (music album/artist cards, video
+// rec rails) so one page can't monopolize the server. Rate-limit pacing and
+// 429 retries live in the transport (shared/http.ts); this only keeps the
+// checks in order with a small gap between them.
+const BADGE_CHECK_GAP_MS = 50;
+let badgeCheckChain: Promise<unknown> = Promise.resolve();
+function throttledBadgeCheck<T>(fn: () => Promise<T>): Promise<T> {
+  const run = badgeCheckChain.then(fn);
+  badgeCheckChain = run
+    .catch(() => undefined)
+    .then(() => new Promise((r) => setTimeout(r, BADGE_CHECK_GAP_MS)));
+  return run;
 }
-let badgeCheckDelayMs = 150; // adaptive: backs off on 429
-async function drainBadgeCheckQueue(): Promise<void> {
-  if (badgeCheckRunning) return;
-  badgeCheckRunning = true;
-  while (badgeCheckQueue.length > 0) {
-    const fn = badgeCheckQueue.shift()!;
-    try {
-      await fn();
-      // Success: ease back toward the fast rate.
-      badgeCheckDelayMs = Math.max(150, Math.floor(badgeCheckDelayMs * 0.9));
-    } catch (e) {
-      // 429 or error: back off.
-      const msg = String(e);
-      if (msg.includes('429') || msg.includes('Too many requests')) {
-        badgeCheckDelayMs = Math.min(2000, badgeCheckDelayMs * 2);
-      }
-      throw e;
-    }
-    await new Promise((r) => setTimeout(r, badgeCheckDelayMs));
-  }
-  badgeCheckRunning = false;
-}
-// Back-compat alias.
 const throttledVideoCheck = throttledBadgeCheck;
+
+/**
+ * Page artist name -> best provider artist hit, remembered for a while.
+ * Watch-state checks resolve every artist named on a page through the
+ * server's metadata search (an external provider call behind the
+ * rate-limited v1 API); SPA re-scans and repeat visits reuse the answer.
+ * Failures aren't remembered.
+ */
+const ARTIST_RESOLVE_TTL_MS = 10 * 60_000;
+const artistResolveCache = new Map<string, { at: number; p: Promise<ArtistHit | null> }>();
+function resolveArtistHit(cfg: ServerConfig, name: string): Promise<ArtistHit | null> {
+  const key = normName(name);
+  const hit = artistResolveCache.get(key);
+  if (hit && Date.now() - hit.at < ARTIST_RESOLVE_TTL_MS) return hit.p;
+  const p = searchArtists(cfg, name, 5).then((hits) => pickBestArtist(hits, name));
+  artistResolveCache.set(key, { at: Date.now(), p });
+  p.catch(() => artistResolveCache.delete(key));
+  return p;
+}
 
 async function handleBadgeAction(m: BadgeAction): Promise<Record<string, unknown>> {
   const cfg = await getConfig();
   if (!cfg) return { error: 'No server configured — open the extension options first.' };
-  try {    if (m.action === 'resolve-artist') {
+  try {
+    if (m.action === 'resolve-artist') {
       return throttledBadgeCheck(async () => {
-        const hits = await searchArtists(cfg, m.name, 5);
-        const best = pickBestArtist(hits, m.name);
+        const best = await resolveArtistHit(cfg, m.name);
         if (!best) return { error: `Couldn't match "${m.name}" on your server.` };
         return { id: best.id, name: best.name, image: best.image, source: best.source };
       });
@@ -286,7 +279,7 @@ async function handleBadgeAction(m: BadgeAction): Promise<Record<string, unknown
       });
     }
     if (m.action === 'wishlist-album') {
-      const n = await wishlistRelease(cfg, {
+      const r = await wishlistRelease(cfg, {
         source: asReleaseSource(m.provider),
         artist: m.artist,
         title: m.title,
@@ -294,7 +287,7 @@ async function handleBadgeAction(m: BadgeAction): Promise<Record<string, unknown
         pageUrl: m.pageUrl,
         tracks: m.tracks,
       });
-      return { ok: true, tracks: n };
+      return { ok: true, tracks: r.added, failed: r.failed.map((f) => f.title) };
     }
     if (m.action === 'wishlist-track') {
       const r = await addToWishlist(cfg, { artist: m.artist, title: m.title });
@@ -357,7 +350,6 @@ async function handleBadgeAction(m: BadgeAction): Promise<Record<string, unknown
   }
 }
 
-browser.runtime.onMessage.addListener((message: unknown) => {
 async function resolveVideoHit(
   cfg: ServerConfig,
   title: string,
@@ -518,6 +510,7 @@ async function handleVideoBadgeAction(m: VideoBadgeAction): Promise<Record<strin
   }
 }
 
+browser.runtime.onMessage.addListener((message: unknown) => {
   const m = message as { type?: string; items?: BadgeCandidate[] } | null;
   if (m?.type === 'SOULSYNC_BADGE_LOOKUP') {
     return (async () => {
@@ -541,8 +534,7 @@ async function handleVideoBadgeAction(m: VideoBadgeAction): Promise<Record<strin
           try {
             let id = it.providerId ?? '';
             if (!id && it.name) {
-              const hits = await searchArtists(cfg, it.name, 5);
-              const best = pickBestArtist(hits, it.name);
+              const best = await resolveArtistHit(cfg, it.name);
               id = best?.id ?? '';
             }
             if (!id) return { watching: null as boolean | null };
@@ -687,6 +679,22 @@ browser.runtime.onMessage.addListener((message: unknown) => {
         return null;
       }
     })();
+  }
+  // Snapshot storage for the offscreen host, which has no chrome.storage.
+  // Chrome closes that document ~30s after audio stops; the next host loads
+  // this back so the queue and position survive.
+  if (m?.type === 'player:saveSnapshot') {
+    const snap = (m as { snapshot?: unknown }).snapshot;
+    return browser.storage.session
+      .set({ playerSnapshot: snap })
+      .then(() => ({ ok: true }))
+      .catch(() => ({ ok: false }));
+  }
+  if (m?.type === 'player:loadSnapshot') {
+    return browser.storage.session
+      .get('playerSnapshot')
+      .then((r) => (r as { playerSnapshot?: unknown }).playerSnapshot ?? null)
+      .catch(() => null);
   }
   // Relay player requests to the audio host. `relayed` marks our own
   // forwards so a context that hears its own message can't loop; the

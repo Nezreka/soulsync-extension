@@ -257,6 +257,7 @@ More detail: [docs/SPEC.md](docs/SPEC.md) (behavior spec), [docs/SERVER_ENDPOINT
 
 - **Test connection fails with a network error:** check the URL (scheme + port, e.g. `http://192.168.1.10:8080`), the API key, and that the server is reachable from this machine. In Firefox, a `NetworkError` with correct credentials usually means the server predates the extension CORS support (PR #1377) — the server sends no CORS headers, so the browser blocks the request before auth is even checked.
 - **"This page isn't reporting anything via its media session":** the page exposes no media metadata (common on non-player pages). The extension says so plainly instead of guessing from the tab title.
+- **"This API key is read-only":** SoulSync can mint read-only keys. They can list your library but can't search, wishlist, watch or load artwork, so Companion needs a full (admin) key.
 - **Firefox forgot the extension after restart:** expected — temporary add-ons don't survive restarts. Reinstall from `dist/` or use the packaged zip.
 
 ---

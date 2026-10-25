@@ -6,6 +6,7 @@ import {
   addToWishlist,
   BADGES_ENABLED_KEY,
   badgesEnabledFromStored,
+  describeReleaseResult,
   directArtwork,
   getConfig,
   getRecentlyAdded,
@@ -590,6 +591,25 @@ function renderRail(cfg: ServerConfig, albums: RecentAlbum[]): void {
       .filter(Boolean)
       .join(' · ');
     item.append(t, sub);
+    if (a.id) {
+      // Same as the panel's Recently Added shelf: click plays the album.
+      item.classList.add('rail-play');
+      item.tabIndex = 0;
+      item.setAttribute('role', 'button');
+      item.title = `Play ${a.title}`;
+      const play = (): void => {
+        // The panel can only open inside the click gesture itself.
+        if (!openMiniPlayerPanel()) void guard(() => openMiniPlayerWindow());
+        void playAlbumById(a.id);
+      };
+      item.addEventListener('click', play);
+      item.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          play();
+        }
+      });
+    }
     rail.appendChild(item);
   }
 }
@@ -650,20 +670,24 @@ async function loadServerExtras(): Promise<void> {
   if (!cfg) return;
   $('server-card').hidden = false;
   renderServerSkeleton();
-  try {
-    const [stats, albums, videos, wishlistCount, videoStats] = await Promise.all([
-      getServerStats(cfg),
-      getRecentlyAdded(cfg, 12),
-      getRecentlyAddedVideos(cfg, 12),
-      getWishlistCount(cfg),
-      getVideoStats(cfg),
-    ]);
-    renderStats(stats, wishlistCount, videoStats);
-    renderRail(cfg, albums);
-    renderVideoRail(cfg, videos);
-  } catch {
+  // Only the stats call decides whether the card shows. The rails and the
+  // counts degrade on their own: a music-only server (no video library) or
+  // one slow endpoint must not take the whole card down with it.
+  const [stats, albums, videos, wishlistCount, videoStats] = await Promise.allSettled([
+    getServerStats(cfg),
+    getRecentlyAdded(cfg, 12),
+    getRecentlyAddedVideos(cfg, 12),
+    getWishlistCount(cfg),
+    getVideoStats(cfg),
+  ]);
+  if (stats.status === 'rejected') {
     $('server-card').hidden = true;
+    return;
   }
+  const ok = <T,>(r: PromiseSettledResult<T>, fallback: T): T => (r.status === 'fulfilled' ? r.value : fallback);
+  renderStats(stats.value, ok(wishlistCount, 0), ok(videoStats, null));
+  renderRail(cfg, ok(albums, [] as RecentAlbum[]));
+  renderVideoRail(cfg, ok(videos, [] as RecentVideo[]));
 }
 
 /* ── tabs ── */
@@ -1281,7 +1305,7 @@ function mediaMusicRow(t: LibraryTrack): HTMLLIElement {
  * Uses the artistId from the track search — the name-based artist lookup
  * is unreliable, so we resolve via the track's artist_id.
  */
-function mediaArtistRow(name: string, artistId: number | null, trackCount: number): HTMLLIElement {
+function mediaArtistRow(name: string, artistId: string | null, trackCount: number): HTMLLIElement {
   const { li, actions } = mediaRowBase(
     name,
     `${trackCount} track${trackCount === 1 ? '' : 's'} in library`,
@@ -1323,7 +1347,7 @@ function mediaAlbumRow(album: LibraryAlbum): HTMLLIElement {
 }
 
 /** Play artist radio by ID: shuffle the artist's library tracks. */
-async function playArtistRadioById(name: string, artistId: number | null): Promise<void> {
+async function playArtistRadioById(name: string, artistId: string | null): Promise<void> {
   if (!cfg || !artistId) return;
   try {
     const albums = await getArtistAlbums(cfg, artistId);
@@ -1341,7 +1365,7 @@ async function playArtistRadioById(name: string, artistId: number | null): Promi
     // Shuffle.
     for (let i = allTracks.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
-      [allTracks[i], allTracks[j]] = [allTracks[i], allTracks[j]];
+      [allTracks[i], allTracks[j]] = [allTracks[j], allTracks[i]];
     }
     const first = toQueueEntry(allTracks[0]);
     enrichQueueArtwork(first);
@@ -1357,18 +1381,18 @@ async function playArtistRadioById(name: string, artistId: number | null): Promi
 }
 
 /** Play an album by ID: first track now, rest queued. */
-async function playAlbumById(albumId: number): Promise<void> {
-  if (!cfg) return;
+async function playAlbumById(albumId: string): Promise<void> {
+  if (!cfg || !albumId) return;
   const state = $('media-state');
   try {
     const tracks = await getAlbumTracks(cfg, albumId);
     if (!tracks.length) {
-      if (state) state.textContent = 'Album is empty on the server.';
+      setStatus('That album is empty on the server.', true);
       return;
     }
     const playable = tracks.filter((t) => t.filePath && !isUnplayableAudio(t.filePath));
     if (!playable.length) {
-      if (state) state.textContent = `No playable tracks (${tracks.length} tracks, none with audio files).`;
+      setStatus(`No playable tracks (${tracks.length} tracks, none with browser-playable files).`, true);
       return;
     }
     const first = toQueueEntry(playable[0]);
@@ -1381,7 +1405,7 @@ async function playAlbumById(albumId: number): Promise<void> {
     }
     if (state) state.textContent = '';
   } catch (e) {
-    if (state) state.textContent = `Couldn't load album: ${e instanceof Error ? e.message : String(e)}`;
+    setStatus(`Couldn't load album: ${e instanceof Error ? e.message : String(e)}`, true);
   }
 }
 
@@ -1409,7 +1433,7 @@ async function mediaSearch(): Promise<void> {
     if (reqId !== mediaReqId) return;
 
     // Merge track results, deduped by ID.
-    const seenIds = new Set<number>();
+    const seenIds = new Set<string>();
     const tracks: LibraryTrack[] = [];
     for (const t of [...tracksByTitle, ...tracksByArtist]) {
       if (!seenIds.has(t.id)) {
@@ -1419,7 +1443,7 @@ async function mediaSearch(): Promise<void> {
     }
 
     // Derive unique artists from track results AND direct artist search.
-    const artistMap = new Map<string, { name: string; artistId: number | null; count: number }>();
+    const artistMap = new Map<string, { name: string; artistId: string | null; count: number }>();
     for (const t of tracks) {
       if (!t.artist) continue;
       const key = t.artist.toLowerCase();
@@ -1613,16 +1637,17 @@ function init(): void {
   $('rel-send').addEventListener('click', () =>
     guard(async () => {
       if (!cfg || !currentRelease) return;
-      const n = await wishlistRelease(cfg, currentRelease);
+      const r = await wishlistRelease(cfg, currentRelease);
+      const what = describeReleaseResult(r);
       await pushHistory({
         kind: 'release',
         title: currentRelease.title,
         artist: currentRelease.artist,
         artwork: '',
-        detail: `${n} track${n === 1 ? '' : 's'} → wishlist`,
+        detail: `${what} → wishlist`,
         at: Date.now(),
       });
-      setStatus(`Sent ${n} track${n === 1 ? '' : 's'} from "${currentRelease.title}" to your wishlist.`);
+      setStatus(`Sent ${what} from "${currentRelease.title}" to your wishlist.`, r.failed.length > 0);
     }),
   );
 
@@ -1653,19 +1678,34 @@ function init(): void {
         setStatus(`Playlist sync started for "${name}".`);
         return;
       }
+      // Every checked line is tried; one unmatched line never stops the rest,
+      // and the misses are named instead of silently dropped.
+      const missed: string[] = [];
+      let added = 0;
       for (const t of tracks) {
-        const r = await addToWishlist(cfg, { artist: t.artist, title: t.title });
-        await rememberWishlisted(r.trackId);
+        try {
+          const r = await addToWishlist(cfg, { artist: t.artist, title: t.title });
+          await rememberWishlisted(r.trackId);
+          added++;
+        } catch {
+          missed.push(`${t.artist} - ${t.title}`);
+        }
       }
+      if (added === 0) throw new Error(`No matches on your server for ${missed.length === 1 ? missed[0] : `any of the ${missed.length} tracks`}.`);
       await pushHistory({
         kind: 'wishlist',
-        title: tracks.length === 1 ? tracks[0].title : `${tracks.length} tracks`,
+        title: added === 1 && tracks.length === 1 ? tracks[0].title : `${added} tracks`,
         artist: tracks.length === 1 ? tracks[0].artist : 'Text import',
         artwork: '',
-        detail: 'Wishlisted',
+        detail: missed.length ? `Wishlisted ${added} of ${tracks.length}` : 'Wishlisted',
         at: Date.now(),
       });
-      setStatus(`Wishlisted ${tracks.length} track${tracks.length === 1 ? '' : 's'}.`);
+      setStatus(
+        missed.length
+          ? `Wishlisted ${added} of ${tracks.length}. No match: ${missed.slice(0, 3).join('; ')}${missed.length > 3 ? ` +${missed.length - 3} more` : ''}`
+          : `Wishlisted ${added} track${added === 1 ? '' : 's'}.`,
+        missed.length > 0,
+      );
     }),
   );
 }

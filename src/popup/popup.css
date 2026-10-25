@@ -1268,3 +1268,9 @@ button.ghost:disabled, button.secondary:disabled, button.primary:disabled {
 @media (prefers-reduced-motion: reduce) {
   .kind-btn, .media-art { transition: none; }
 }
+
+/* Recently added: album tiles play on click. */
+.rail-item.rail-play { cursor: pointer; border-radius: 8px; }
+.rail-item.rail-play:hover .rail-art,
+.rail-item.rail-play:focus-visible .rail-art { filter: brightness(1.15); }
+.rail-item.rail-play:focus-visible { outline: 2px solid var(--accent, #8b5cf6); outline-offset: 2px; }

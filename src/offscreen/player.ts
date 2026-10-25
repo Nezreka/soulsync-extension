@@ -15,6 +15,7 @@ import browser from 'webextension-polyfill';
 import { startAudioHost } from '../player/host.js';
 import { libraryAudioUrl } from '../shared/player-api.js';
 import type { ServerConfig } from '../shared/types.js';
+import type { PlayerSnapshot } from '../player/types.js';
 
 async function getConfigViaSw(): Promise<ServerConfig | null> {
   try {
@@ -28,6 +29,25 @@ async function getConfigViaSw(): Promise<ServerConfig | null> {
   }
 }
 
+/** Snapshot storage through the worker — this document can't reach chrome.storage. */
+async function saveSnapshotViaSw(snapshot: PlayerSnapshot): Promise<void> {
+  await browser.runtime.sendMessage({ type: 'player:saveSnapshot', snapshot });
+}
+
+async function loadSnapshotViaSw(): Promise<unknown> {
+  try {
+    return (await browser.runtime.sendMessage({ type: 'player:loadSnapshot' })) ?? null;
+  } catch {
+    return null;
+  }
+}
+
 console.debug('[soulsync-player] offscreen document loaded — starting audio host');
-startAudioHost({ resolveAudioUrl: libraryAudioUrl, getConfig: getConfigViaSw, acceptRelayedOnly: true });
+startAudioHost({
+  resolveAudioUrl: libraryAudioUrl,
+  getConfig: getConfigViaSw,
+  acceptRelayedOnly: true,
+  saveSnapshot: saveSnapshotViaSw,
+  loadSnapshot: loadSnapshotViaSw,
+});
 console.debug('[soulsync-player] audio host started');

@@ -161,6 +161,31 @@ requirement.
 
 ---
 
+## Server facts the client is built around (verified Oct 25, 2026)
+
+- **Library ids are TEXT.** `artists`, `albums` and `tracks` ids went TEXT in
+  `music_database.py::_migrate_id_columns_to_text`, and v1 serializers pass
+  them through raw: Plex rows arrive as numeric strings (`"142795"`), Jellyfin
+  as hex GUIDs, Navidrome as opaque slugs, standalone rows as
+  `<hash>::soulsync`. The client keeps them as strings (`LibraryId` in
+  `shared/player-api.ts`) and never parses them. Video and mirrored-playlist
+  ids are still integers.
+- **v1 is rate-limited to 60 requests/minute per IP** (`api/__init__.py`,
+  flask-limiter fixed window, no `Retry-After`). `shared/http.ts` paces v1
+  calls to 45/minute per extension context and retries a 429 after a backoff;
+  every server request also has a timeout.
+- **Track badges batch through `POST /api/library/check-tracks`**
+  `{artist_name, tracks: [{name}]}` → `{success, owned_tracks: {name: {owned,
+  track_id, file_path, …}}}`: the web UI's own ownership matcher, one request
+  per artist, non-v1 so not rate-limited. A missing route (older server) falls
+  back to search → `GET /api/v1/library/lookup` → `GET /api/v1/library/tracks`.
+- **Album badges use `GET /api/v1/library/artists/<id>/albums`**, once per
+  artist, matched locally.
+- **Read-only API keys** (`scope: "read"`) pass every GET under `/api/v1/` but
+  get `403 INSUFFICIENT_SCOPE` on every POST and every non-v1 route
+  (`api/auth.py::enforce_read_key_scope`). Test connection probes
+  `POST /api/watchlist/check` and refuses a read key with a plain message.
+
 ## Known server issue (confirmed Sep 28, 2026 — fix deferred)
 
 **`POST /api/v1/request` bypasses the download blocklist.** The web UI's

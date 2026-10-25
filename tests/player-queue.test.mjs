@@ -15,9 +15,11 @@ import {
   queueLast,
   queueNext,
   removeAt,
+  restoreQueueState,
   setIndex,
   shuffle,
 } from '../src/player/queue.ts';
+import { libraryAudioUrl, mapLibraryTrack, toQueueEntry } from '../src/shared/player-api.ts';
 
 let fails = 0;
 function eq(name, got, want) {
@@ -169,6 +171,50 @@ const titles = (s) => s.entries.map((e) => e.title);
   s.entries = [a];
   s.index = 99;
   eq("currentEntry out of range -> null", currentEntry(s), null);
+}
+
+/* ── restoreQueueState: the queue survives Chrome closing the offscreen host ── */
+{
+  const r = restoreQueueState({
+    queue: [
+      { kind: 'audio', title: 'A', trackId: 142795 },
+      { kind: 'bogus', title: 'X' },
+      { kind: 'audio', title: 'B', trackId: '369dcfe2b649cf4a' },
+      { kind: 'audio', title: 'C' },
+    ],
+    index: 2,
+  });
+  eq("restore drops malformed entries", r.entries.map((e) => e.title), ['A', 'B', 'C']);
+  eq("restore remaps index past dropped entries", r.index, 1);
+  eq("restore normalizes numeric trackId to string", r.entries[0].trackId, '142795');
+  eq("restore keeps string trackId", r.entries[1].trackId, '369dcfe2b649cf4a');
+  eq("restore of nothing -> empty", restoreQueueState(null), { entries: [], index: -1 });
+  eq("restore of empty queue -> empty", restoreQueueState({ queue: [], index: 0 }), { entries: [], index: -1 });
+  eq("restore clamps index", restoreQueueState({ queue: [a, b], index: 9 }).index, 1);
+}
+
+/* ── library ids are TEXT on the server: never parse them as numbers ── */
+{
+  const jf = mapLibraryTrack({
+    id: '0015c50a3b0c8309df179e77aa253dc8', title: 'T', artist_name: 'X',
+    album_id: '7e9fcafe', artist_id: '369dcfe2b649cf4a43dcf100f03623d4',
+    file_path: '/m/t.flac', duration: 61000,
+  });
+  eq("jellyfin track id kept verbatim", jf.id, '0015c50a3b0c8309df179e77aa253dc8');
+  eq("jellyfin album id not parseInt'd", jf.albumId, '7e9fcafe');
+  eq("jellyfin artist id kept", jf.artistId, '369dcfe2b649cf4a43dcf100f03623d4');
+  eq("duration ms -> s", jf.durationSec, 61);
+  const plex = mapLibraryTrack({ id: '142795', album_id: 142796, title: 'P', file_path: '/p.mp3' });
+  eq("plex numeric-string id", plex.id, '142795');
+  eq("numeric album id -> string", plex.albumId, '142796');
+  eq("missing ids -> null", mapLibraryTrack({ title: 'N' }).artistId, null);
+  const entry = toQueueEntry(jf);
+  eq("queue entry carries string trackId", entry.trackId, '0015c50a3b0c8309df179e77aa253dc8');
+  const url = libraryAudioUrl({ url: 'http://s', apiKey: 'k' }, entry);
+  eq("stream url carries the exact track id",
+    new URL(url).searchParams.get('track_id'), '0015c50a3b0c8309df179e77aa253dc8');
+  eq("no id -> no track_id param",
+    new URL(libraryAudioUrl({ url: 'http://s', apiKey: 'k' }, { audioPath: '/a.mp3' })).searchParams.has('track_id'), false);
 }
 
 if (fails) { console.error(`${fails} FAILURES`); process.exit(1); }

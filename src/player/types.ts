@@ -13,7 +13,8 @@ export interface QueueEntry {
   artworkUrl?: string;
   /** Server-relative file path for audio streams (GET /stream/library-audio?path=...). */
   audioPath?: string;
-  trackId?: number;
+  /** Library track id — TEXT on the server (see shared/player-api.ts LibraryId). */
+  trackId?: string;
   videoKd?: 'm' | 't';
   videoId?: number;
   season?: number;
@@ -107,4 +108,10 @@ export type PlayerMessage =
    * (stable across shuffles/removals). Sent by UI remotes after a
    * best-effort Deezer lookup; the host repaints and refreshes MediaSession.
    */
-  | { type: 'player:setArtwork'; trackId: number; artworkUrl: string };
+  | { type: 'player:setArtwork'; trackId: string; artworkUrl: string }
+  /**
+   * Host → service worker storage relay (Chrome: the offscreen document has
+   * no chrome.storage). Answered by the worker, never by the host.
+   */
+  | { type: 'player:saveSnapshot'; snapshot: PlayerSnapshot }
+  | { type: 'player:loadSnapshot' };

@@ -123,3 +123,44 @@ export function advance(state: PlayerQueueState, dir: 'next' | 'prev'): number {
   state.index = dir === 'next' ? (state.index + 1) % n : (state.index - 1 + n) % n;
   return state.index;
 }
+
+/**
+ * Rebuild queue state from a persisted snapshot, defensively: Chrome closes
+ * the offscreen audio document ~30s after playback stops, so the host that
+ * comes back must pick the queue up from storage instead of starting empty.
+ * Malformed entries are dropped; a numeric trackId from an older build is
+ * normalized to the string form the server's TEXT ids use.
+ */
+export function restoreQueueState(saved: unknown): PlayerQueueState {
+  const state = createQueueState();
+  if (!saved || typeof saved !== 'object') return state;
+  const o = saved as { queue?: unknown; index?: unknown };
+  if (!Array.isArray(o.queue)) return state;
+  const keep: boolean[] = [];
+  for (const raw of o.queue) {
+    const e = raw as Partial<QueueEntry> | null;
+    const ok =
+      !!e &&
+      (e.kind === 'audio' || e.kind === 'video') &&
+      typeof e.title === 'string' &&
+      e.title.length > 0;
+    keep.push(ok);
+    if (!ok) continue;
+    const entry = { ...(e as QueueEntry) };
+    const tid = (e as { trackId?: unknown }).trackId;
+    if (typeof tid === 'number' && Number.isFinite(tid)) entry.trackId = String(tid);
+    else if (typeof tid !== 'string' || !tid) delete entry.trackId;
+    state.entries.push(entry);
+  }
+  if (state.entries.length === 0) return state;
+  // Map the saved index past any dropped entries.
+  const savedIndex = typeof o.index === 'number' && Number.isInteger(o.index) ? o.index : 0;
+  let idx = -1;
+  for (let i = 0, kept = 0; i < keep.length; i++) {
+    if (!keep[i]) continue;
+    if (i <= savedIndex) idx = kept;
+    kept++;
+  }
+  state.index = Math.max(0, Math.min(idx, state.entries.length - 1));
+  return state;
+}

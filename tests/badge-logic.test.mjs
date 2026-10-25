@@ -16,6 +16,9 @@ import {
   pickBestArtist,
   primaryArtistForMatch,
   resolveLibraryLink,
+  apiKeyScope,
+  describeReleaseResult,
+  wishlistRelease,
 } from "../src/shared/api.ts";
 import {
   artistFromVideoTitle,
@@ -79,11 +82,24 @@ eq("top-hit fallback", pickBest(hits, { artist: "X", title: "Nope" })?.id, "1");
 eq("no hits null", pickBest([], { artist: "X", title: "Y" }), null);
 
 /* ── tri-state library checks ── */
-const ARTISTS = { drake: { name: "Drake", id: 42 } };
-const ALBUMS = { "42:views": { title: "Views", id: 7 } };
-const TRACKS = {
-  "spotify:onedance": { id: 9, album_id: 7, artist_id: 42, title: "One Dance" },
+// Ids are TEXT on the real server (music_database._migrate_id_columns_to_text):
+// Plex rows come back as numeric strings, Jellyfin as hex GUIDs.
+const JF = "369dcfe2b649cf4a43dcf100f03623d4";
+const ARTISTS = {
+  drake: { name: "Drake", id: "42" },
+  "jelly band": { name: "Jelly Band", id: JF },
+  "broken shelf": { name: "Broken Shelf", id: "500" },
 };
+const ALBUMS = {
+  "42": [{ title: "Views", id: "7" }, { title: "Scorpion", id: "8" }],
+  [JF]: [{ title: "Glass", id: "0015c50a3b0c8309df179e77aa253dc8" }],
+};
+const TRACKS = {
+  "spotify:onedance": { id: "9", album_id: "7", artist_id: "42", title: "One Dance" },
+};
+// /api/library/check-tracks: the server's batched ownership matcher.
+const OWNED = { drake: ["One Dance"] };
+let checkTracksCalls = 0;
 globalThis.fetch = async (url, init) => {
   const u = new URL(url);
   const fail = () => ({ ok: false, status: 500, json: async () => ({}) });
@@ -95,12 +111,21 @@ globalThis.fetch = async (url, init) => {
       .filter(([k]) => w && (w.includes(k) || k.includes(w))).map(([, v]) => v);
     return { ok: true, status: 200, json: async () => ({ success: true, data: { artists: found } }) };
   }
-  if (u.pathname === "/api/v1/library/albums") {
-    const q = u.searchParams.get("search") || "";
-    const aid = u.searchParams.get("artist_id");
-    if (q.toLowerCase().includes("boom")) return fail();
-    const hit = ALBUMS[`${aid}:${normName(q)}`];
-    return { ok: true, status: 200, json: async () => ({ success: true, data: { albums: hit ? [hit] : [] } }) };
+  const albumsPath = u.pathname.match(/^\/api\/v1\/library\/artists\/([^/]+)\/albums$/);
+  if (albumsPath) {
+    if (albumsPath[1] === "500") return fail();
+    const albums = ALBUMS[decodeURIComponent(albumsPath[1])] ?? [];
+    return { ok: true, status: 200, json: async () => ({ success: true, data: { albums } }) };
+  }
+  if (u.pathname === "/api/library/check-tracks") {
+    checkTracksCalls++;
+    const body = JSON.parse(String((init && init.body) || "{}"));
+    if (normName(body.artist_name).includes("boom")) return fail();
+    if (normName(body.artist_name) === "old server") return { ok: false, status: 404, json: async () => ({}) };
+    const owned = OWNED[normName(body.artist_name)] ?? [];
+    const owned_tracks = {};
+    for (const t of body.tracks) owned_tracks[t.name] = { owned: owned.includes(t.name) };
+    return { ok: true, status: 200, json: async () => ({ success: true, owned_tracks }) };
   }
   if (u.pathname === "/api/v1/search/tracks") {
     const body = JSON.parse(String((init && init.body) || "{}"));
@@ -170,8 +195,11 @@ const r = await lookupBadgeStatuses(cfg, [
   { kind: "album", name: "Views", artist: "Drake" },
   { kind: "album", name: "Nope", artist: "Drake" },
   { kind: "album", name: "Views", artist: "Nobody Here" },
-  { kind: "album", name: "Boom", artist: "Drake" },
+  { kind: "album", name: "Views", artist: "Broken Shelf" },
   { kind: "album", name: "Views" },  // no artist -> unverifiable
+  { kind: "artist", name: "Jelly Band" },
+  { kind: "album", name: "Glass", artist: "Jelly Band" },
+  { kind: "album", name: "Scorpion", artist: "Drake" },
 ]);
 eq("artist in library -> true", r["artist:drake"], true);
 eq("artist absent -> false", r["artist:nobody here"], false);
@@ -179,8 +207,26 @@ eq("artist server 500 -> null", r["artist:boom artist"], null);
 eq("album exact under artist id -> true", r["album:drake views"], true);
 eq("album title absent under artist -> false", r["album:drake nope"], false);
 eq("album, artist absent -> false", r["album:nobody here views"], false);
-eq("album server 500 -> null", r["album:drake boom"], null);
+eq("album server 500 -> null", r["album:broken shelf views"], null);
 eq("album w/o artist -> null", r["album:views"], null);
+eq("jellyfin hex artist id -> in library", r["artist:jelly band"], true);
+eq("jellyfin hex album id -> in library", r["album:jelly band glass"], true);
+eq("second album of same artist -> true", r["album:drake scorpion"], true);
+
+/* ── track badges: batched through /api/library/check-tracks ── */
+{
+  checkTracksCalls = 0;
+  const t = await lookupBadgeStatuses(cfg, [
+    { kind: "track", name: "One Dance", artist: "Drake" },
+    { kind: "track", name: "Hotline Bling", artist: "Drake" },
+  ]);
+  eq("check-tracks owned -> true", t["track:drake one dance"], true);
+  eq("check-tracks not owned (single artist) -> false", t["track:drake hotline bling"], false);
+  eq("same-artist tracks share one check-tracks call", checkTracksCalls, 1);
+  // Older server without the batch route: the per-track path still answers.
+  const old = await lookupBadgeStatuses(cfg, [{ kind: "track", name: "One Dance", artist: "Old Server" }]);
+  eq("check-tracks missing -> per-track fallback answers", old["track:old server one dance"], true);
+}
 
 /* ── youtube parsers ── */
 eq("channel og:title", channelArtistFromOgTitle("Drake"), "Drake");
@@ -299,6 +345,8 @@ eq("link artist absent -> filtered grid", await resolveLibraryLink(cfg, "artist"
   { url: "http://x/library?q=Nobody%20Here", exact: false });
 eq("link artist error -> filtered grid", await resolveLibraryLink(cfg, "artist", "Boom Artist"),
   { url: "http://x/library?q=Boom%20Artist", exact: false });
+eq("link jellyfin artist id", await resolveLibraryLink(cfg, "artist", "Jelly Band"),
+  { url: `http://x/artist-detail/library/${JF}`, exact: true });
 eq("link album exact pins album", await resolveLibraryLink(cfg, "album", "Views", "Drake"),
   { url: "http://x/artist-detail/library/42?album=7", exact: true });
 eq("link album title absent -> artist page", await resolveLibraryLink(cfg, "album", "Nope", "Drake"),
@@ -580,6 +628,57 @@ eq("switch empty get -> on", badgesEnabledFromStored(undefined), true);
 eq("switch false -> off", badgesEnabledFromStored({ [BADGES_ENABLED_KEY]: false }), false);
 eq("switch true -> on", badgesEnabledFromStored({ [BADGES_ENABLED_KEY]: true }), true);
 eq("switch junk -> on", badgesEnabledFromStored({ [BADGES_ENABLED_KEY]: "nope" }), true);
+
+/* ── wishlistRelease: a miss mid-release no longer drops the rest ── */
+{
+  const prev = globalThis.fetch;
+  const wished = [];
+  globalThis.fetch = async (url, init) => {
+    const u = new URL(url);
+    const body = JSON.parse(String((init && init.body) || "{}"));
+    if (u.pathname === "/api/v1/search/tracks") {
+      const q = String(body.query);
+      const tracks = q.includes("Ghost") ? [] : [{ id: q, name: q.split(" - ")[1], artists: [{ name: "A" }], album: "R" }];
+      return { ok: true, status: 200, json: async () => ({ success: true, data: { tracks, source: "spotify" } }) };
+    }
+    if (u.pathname === "/api/v1/wishlist") {
+      wished.push(body.track_data.name);
+      return { ok: true, status: 200, json: async () => ({ success: true, data: { created: true } }) };
+    }
+    throw new Error("unexpected " + u.pathname);
+  };
+  try {
+    const rel = { artist: "A", title: "R", label: "", pageUrl: "", tracks: ["One", "Ghost", "Three"] };
+    const r = await wishlistRelease(cfg, rel);
+    eq("release: tracks after a miss still land", wished, ["One", "Three"]);
+    eq("release: miss reported by name", r.failed.map((f) => f.title), ["Ghost"]);
+    eq("release: summary", describeReleaseResult(r), "2 of 3 tracks (no match: Ghost)");
+    let err = "";
+    try { await wishlistRelease(cfg, { ...rel, tracks: [] }); } catch (e) { err = e.message; }
+    eq("release: empty tracklist is an error, not '0 sent'", /No tracklist/.test(err), true);
+    err = "";
+    try { await wishlistRelease(cfg, { ...rel, tracks: ["Ghost"] }); } catch (e) { err = e.message; }
+    eq("release: nothing landed is an error", /None of the 1/.test(err), true);
+  } finally {
+    globalThis.fetch = prev;
+  }
+}
+
+/* ── apiKeyScope: read-only keys are caught at setup ── */
+{
+  const prev = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => ({ ok: false, status: 403,
+      json: async () => ({ success: false, error: { code: "INSUFFICIENT_SCOPE", message: "read-only" } }) });
+    eq("read key detected", await apiKeyScope(cfg), "read");
+    globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ success: true, is_watching: false }) });
+    eq("admin key", await apiKeyScope(cfg), "admin");
+    globalThis.fetch = async () => ({ ok: false, status: 500, json: async () => ({}) });
+    eq("unclassifiable -> unknown (no false alarm)", await apiKeyScope(cfg), "unknown");
+  } finally {
+    globalThis.fetch = prev;
+  }
+}
 
 if (fails) { console.error(`${fails} FAILURES`); process.exit(1); }
 console.log("ALL LOGIC + YOUTUBE PARSER TESTS PASSED");

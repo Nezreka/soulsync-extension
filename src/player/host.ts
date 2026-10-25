@@ -22,6 +22,7 @@ import {
   queueLast,
   queueNext,
   removeAt,
+  restoreQueueState,
   setIndex,
   shuffle,
   type PlayerQueueState,
@@ -46,6 +47,14 @@ export interface AudioHostOpts {
    * `player:ping` / `player:ensureHost` probes are still answered either way.
    */
   acceptRelayedOnly?: boolean;
+  /**
+   * Where snapshots live. Defaults to storage.session in this context. The
+   * Chrome offscreen document has no chrome.storage, so it passes
+   * service-worker-backed versions — without them nothing was ever saved
+   * there, and the queue died with the document.
+   */
+  saveSnapshot?: (snap: PlayerSnapshot) => Promise<void>;
+  loadSnapshot?: () => Promise<unknown>;
 }
 
 export interface AudioHostHandle {
@@ -54,6 +63,8 @@ export interface AudioHostHandle {
 }
 
 const SNAPSHOT_KEY = 'playerSnapshot';
+/** Position-only saves (timeupdate) are throttled to this; state changes save at once. */
+const POSITION_PERSIST_MS = 5000;
 const WMA_SKIP_MESSAGE = "WMA audio can't be decoded by browsers — skipping";
 const VIDEO_SKIP_MESSAGE = 'Video entries play in the mini player — skipping';
 
@@ -67,7 +78,15 @@ function clampVolume(v: number): number {
 }
 
 export function startAudioHost(opts: AudioHostOpts): AudioHostHandle {
-  const q: PlayerQueueState = createQueueState();
+  let q: PlayerQueueState = createQueueState();
+  const saveSnapshot =
+    opts.saveSnapshot ??
+    (async (snap: PlayerSnapshot) => {
+      await browser.storage.session.set({ [SNAPSHOT_KEY]: snap });
+    });
+  const loadSnapshot =
+    opts.loadSnapshot ??
+    (async () => (await browser.storage.session.get(SNAPSHOT_KEY))[SNAPSHOT_KEY]);
   const audio = document.createElement('audio');
   audio.preload = 'auto';
 
@@ -79,6 +98,8 @@ export function startAudioHost(opts: AudioHostOpts): AudioHostHandle {
   /** Guards against stale async loads (user hit next while a track was resolving). */
   let loadSeq = 0;
   let lastPersistAt = 0;
+  /** Where a restored track resumes on its next play (seconds). */
+  let resumeAt = 0;
 
   audio.volume = volume;
 
@@ -96,15 +117,44 @@ export function startAudioHost(opts: AudioHostOpts): AudioHostHandle {
   }
 
   async function persist(force = false): Promise<void> {
+    if (!restored) return; // never overwrite the saved queue with the empty boot state
     const now = Date.now();
-    if (!force && now - lastPersistAt < 1000) return;
+    if (!force && now - lastPersistAt < POSITION_PERSIST_MS) return;
     lastPersistAt = now;
     try {
-      await browser.storage.session.set({ [SNAPSHOT_KEY]: snapshot() });
+      await saveSnapshot(snapshot());
     } catch {
-      /* storage.session may be unavailable in some contexts — playback continues */
+      /* storage may be unavailable in some contexts — playback continues */
     }
   }
+
+  /**
+   * Pick up the queue a previous host left behind (Chrome closes an idle
+   * offscreen document; Firefox suspends the background page). It comes
+   * back paused at the saved position — never auto-playing on its own.
+   */
+  let restored = false;
+  const ready: Promise<void> = (async () => {
+    try {
+      const saved = await loadSnapshot();
+      const rq = restoreQueueState(saved);
+      if (rq.entries.length > 0) {
+        q = rq;
+        const o = saved as Partial<PlayerSnapshot>;
+        volume = clampVolume(typeof o.volume === 'number' ? o.volume : 1);
+        audio.volume = volume;
+        positionSec = typeof o.positionSec === 'number' && o.positionSec > 0 ? o.positionSec : 0;
+        durationSec = typeof o.durationSec === 'number' && o.durationSec > 0 ? o.durationSec : 0;
+        resumeAt = positionSec;
+        status = 'paused';
+        const cur = currentEntry(q);
+        if (cur && cur.kind === 'audio') setMediaSession(cur);
+      }
+    } catch {
+      /* nothing saved, or storage unavailable — start empty */
+    }
+    restored = true;
+  })();
 
   function broadcast(): void {
     try {
@@ -122,6 +172,7 @@ export function startAudioHost(opts: AudioHostOpts): AudioHostHandle {
     void persist(true);
     broadcast();
     updatePlayingBadge();
+    setMediaPosition();
   }
 
   /**
@@ -172,6 +223,24 @@ export function startAudioHost(opts: AudioHostOpts): AudioHostHandle {
     }
   }
 
+  /** Feed the OS media HUD its scrubber; best-effort, throws on bad values. */
+  function setMediaPosition(): void {
+    if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
+    try {
+      navigator.mediaSession.playbackState =
+        status === 'playing' ? 'playing' : status === 'paused' ? 'paused' : 'none';
+      if (durationSec > 0 && positionSec <= durationSec) {
+        navigator.mediaSession.setPositionState({
+          duration: durationSec,
+          position: Math.max(0, positionSec),
+          playbackRate: 1,
+        });
+      }
+    } catch {
+      /* setPositionState unsupported or rejected */
+    }
+  }
+
   function wireMediaSessionActions(): void {
     if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
     const ms = navigator.mediaSession;
@@ -181,6 +250,10 @@ export function startAudioHost(opts: AudioHostOpts): AudioHostHandle {
       ['previoustrack', () => step('prev')],
       ['nexttrack', () => step('next')],
     ];
+    handlers.push(
+      ['seekbackward', () => doSeek(Math.max(0, (audio.currentTime || 0) - 10))],
+      ['seekforward', () => doSeek((audio.currentTime || 0) + 10)],
+    );
     for (const [action, fn] of handlers) {
       try {
         ms.setActionHandler(action, fn);
@@ -229,7 +302,7 @@ export function startAudioHost(opts: AudioHostOpts): AudioHostHandle {
 
   // Cover-art lookups in flight, keyed by track id so a track that starts
   // playing twice never double-fetches.
-  const artInFlight = new Set<number>();
+  const artInFlight = new Set<string>();
 
   // Resolve cover art for the entry now loading, whichever UI started
   // playback (popup, badge click, queue advance — none of them have to
@@ -317,9 +390,27 @@ export function startAudioHost(opts: AudioHostOpts): AudioHostHandle {
     }
     if (token !== loadSeq) return;
 
-    positionSec = 0;
+    // A restored queue resumes where it stopped; any fresh load starts at 0.
+    const startAt = resumeAt;
+    resumeAt = 0;
+    positionSec = startAt;
     durationSec = entry.durationSec ?? 0;
     audio.src = url;
+    if (startAt > 0) {
+      audio.addEventListener(
+        'loadedmetadata',
+        () => {
+          if (token === loadSeq) {
+            try {
+              audio.currentTime = startAt;
+            } catch {
+              /* not seekable — start from the top */
+            }
+          }
+        },
+        { once: true },
+      );
+    }
     try {
       await audio.play();
     } catch (e) {
@@ -334,6 +425,7 @@ export function startAudioHost(opts: AudioHostOpts): AudioHostHandle {
 
   function stopPlayback(): void {
     loadSeq++;
+    resumeAt = 0;
     try {
       audio.pause();
     } catch {
@@ -382,6 +474,7 @@ export function startAudioHost(opts: AudioHostOpts): AudioHostHandle {
   }
 
   function step(dir: 'next' | 'prev'): void {
+    resumeAt = 0;
     // No repeat mode: advancing past the last entry stops instead of
     // wrapping. A finished song plays once — it must not loop forever.
     if (dir === 'next' && q.index >= q.entries.length - 1) {
@@ -449,7 +542,8 @@ export function startAudioHost(opts: AudioHostOpts): AudioHostHandle {
   });
   audio.addEventListener('timeupdate', () => {
     positionSec = audio.currentTime;
-    void persist(false); // throttled to ~1/sec
+    void persist(false); // throttled
+    setMediaPosition();
   });
   audio.addEventListener('error', () => {
     const entry = currentEntry(q);
@@ -467,6 +561,8 @@ export function startAudioHost(opts: AudioHostOpts): AudioHostHandle {
 
   const onMessage = (message: unknown): Promise<PlayerSnapshot | { ok: true }> | undefined => {
     if (!isPlayerMessage(message)) return undefined; // not ours — other listeners handle it
+    // The worker's own storage traffic for this host — never ours to answer.
+    if (message.type === 'player:saveSnapshot' || message.type === 'player:loadSnapshot') return undefined;
     if (
       opts.acceptRelayedOnly === true &&
       (message as { relayed?: unknown }).relayed !== true &&
@@ -475,6 +571,9 @@ export function startAudioHost(opts: AudioHostOpts): AudioHostHandle {
     ) {
       return undefined; // Chrome: all player traffic routes via the service worker relay
     }
+    // Every answer waits for the restore, so a popup reattaching to a
+    // freshly recreated host sees the saved queue, not a blank one.
+    if (!restored) return ready.then(() => onMessage(message) ?? snapshot());
     switch (message.type) {
       case 'player:ensureHost':
         return Promise.resolve({ ok: true });
@@ -483,6 +582,7 @@ export function startAudioHost(opts: AudioHostOpts): AudioHostHandle {
       case 'player:getState':
         return Promise.resolve(snapshot());
       case 'player:playNow': {
+        resumeAt = 0;
         playNow(q, message.entry);
         void persist(true);
         broadcast();
@@ -545,6 +645,7 @@ export function startAudioHost(opts: AudioHostOpts): AudioHostHandle {
         return Promise.resolve(snapshot());
       case 'player:setIndex': {
         if (!setIndex(q, message.index)) return Promise.resolve(snapshot());
+        resumeAt = 0;
         void persist(true);
         broadcast();
         return loadCurrentAndPlay().then(() => snapshot());
@@ -567,8 +668,6 @@ export function startAudioHost(opts: AudioHostOpts): AudioHostHandle {
   browser.runtime.onMessage.addListener(onMessage);
 
   wireMediaSessionActions();
-  // Initial snapshot so a freshly opened popup reattaches to something sane.
-  void persist(true);
 
   return {
     getSnapshot: snapshot,
