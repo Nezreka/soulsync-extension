@@ -77,6 +77,42 @@ export async function saveConfig(cfg: ServerConfig): Promise<void> {
   });
 }
 
+/** fetch() network failures, per browser. A TypeError with any other
+ * message is a local problem (an invalid header value from a pasted API
+ * key, say), not the network — it keeps its own, more useful message. */
+const NETWORK_TYPE_ERROR = /networkerror|failed to fetch|load failed|network request failed/i;
+
+/**
+ * Rewrite a raw transport failure from a server call into guidance a person
+ * can act on. fetch() reports every network failure the same opaque way
+ * ("NetworkError when attempting to fetch resource." in Firefox, "Failed to
+ * fetch" in Chrome), but against a plain-http server address one common
+ * cause is specific enough to name: with HTTPS-Only Mode on, Firefox
+ * upgrades the request to https, and a SoulSync server on a LAN address
+ * does not speak TLS, so the upgraded request dies before it ever reaches
+ * the server — the console shows "Upgrading insecure request …" followed
+ * by a CORS block against the https URL (extension issue #2). The hint
+ * keeps the original error text and names that cause alongside the
+ * mundane ones (server off, old server without CORS support). Errors
+ * where the server actually answered pass through untouched.
+ */
+export function connectionHint(cfg: ServerConfig, e: unknown): Error {
+  const original = e instanceof Error ? e : new Error(String(e));
+  if (e instanceof TypeError && NETWORK_TYPE_ERROR.test(e.message)
+    && cfg.url.replace(/\/+$/, '').toLowerCase().startsWith('http://')) {
+    return new Error(
+      `Could not reach your server at ${cfg.url} — nothing answered at all (${original.message}). ` +
+        'Check the server is running and this address is reachable from this machine. One common ' +
+        'cause on Firefox: with HTTPS-Only Mode on, it upgrades the request to https, which a ' +
+        'local SoulSync server cannot answer — add an exception for this address under Firefox ' +
+        'Settings → Privacy & Security → HTTPS-Only Mode → Manage Exceptions, or serve SoulSync ' +
+        'over https and use that URL instead. A very old server may also predate the CORS support ' +
+        'the extension needs; updating SoulSync fixes that.',
+    );
+  }
+  return original;
+}
+
 /**
  * Ask for host permission (needed for fetch to bypass CORS), then hit a cheap
  * authenticated GET. Anything 2xx means URL + key work.
@@ -89,7 +125,11 @@ export async function testConnection(cfg: ServerConfig): Promise<string> {
   // when the origin is already granted, so no contains() check is needed.
   const granted = await browser.permissions.request({ origins: [origin] });
   if (!granted) throw new Error('Permission to reach your server was not granted.');
-  await apiFetch(cfg, `${V1}/playlists`, { method: 'GET' });
+  try {
+    await apiFetch(cfg, `${V1}/playlists`, { method: 'GET' });
+  } catch (e) {
+    throw connectionHint(cfg, e);
+  }
   if ((await apiKeyScope(cfg)) === 'read') {
     throw new Error(
       'This API key is read-only. Companion searches, wishlists and watches, so it needs a full ' +
@@ -1323,6 +1363,113 @@ export async function getRecentlyAddedVideos(cfg: ServerConfig, limit = 12): Pro
         : typeof o.created_at === 'string' ? o.created_at : '',
     };
   });
+}
+
+/** The popup server card's last good data, kept in storage so the next open
+ * paints instantly and refreshes behind (stale-while-revalidate). A rail is
+ * null when it has never landed for this server (e.g. an old server whose
+ * video routes 404): it paints as a skeleton, never as a fake empty rail. */
+export interface ServerCardSnapshot {
+  url: string;
+  savedAt: number;
+  /** When the stats in this snapshot were actually fetched. Sections land
+   * independently, so the overall stamp must not vouch for the counts. */
+  statsSavedAt: number;
+  stats: ServerStats;
+  wishlistCount: number;
+  videoStats: VideoStats | null;
+  albums: RecentAlbum[] | null;
+  videos: RecentVideo[] | null;
+}
+
+/**
+ * Shape-check a stored snapshot before the popup paints from it. Storage
+ * survives extension updates, and this repo has shipped a data-shape
+ * migration before (string library ids): a snapshot written by another
+ * version must be rejected here, because the renderers trust the shape
+ * blindly and a crash mid-paint would repeat on every open with no way
+ * for fresh data to overwrite the poisoned entry.
+ */
+export function isServerCardSnapshot(v: unknown): v is ServerCardSnapshot {
+  if (typeof v !== 'object' || v === null) return false;
+  const s = v as Record<string, unknown>;
+  const num = (x: unknown): boolean => typeof x === 'number' && Number.isFinite(x);
+  if (typeof s.url !== 'string' || !num(s.savedAt) || !num(s.statsSavedAt)) return false;
+  const stats = s.stats as Record<string, unknown> | null;
+  if (typeof stats !== 'object' || stats === null) return false;
+  if (!num(stats.tracks) || !num(stats.artists)
+    || !num(stats.albums) || !num(stats.activeDownloads)
+    || typeof stats.lastUpdate !== 'string') return false;
+  if (!num(s.wishlistCount)) return false;
+  if (s.videoStats !== null) {
+    const vs = s.videoStats as Record<string, unknown>;
+    if (typeof vs !== 'object' || Array.isArray(vs) || !num(vs.movies) || !num(vs.shows)
+      || !num(vs.episodes) || !num(vs.wishlist)) return false;
+  }
+  const albumOk = (a: unknown): boolean => {
+    const o = a as Record<string, unknown>;
+    return typeof o === 'object' && o !== null && typeof o.title === 'string'
+      && typeof o.thumb === 'string' && typeof o.addedAt === 'string'
+      && (typeof o.year === 'number' || o.year === null)
+      && (typeof o.id === 'string' || typeof o.id === 'number');
+  };
+  const videoOk = (x: unknown): boolean => {
+    const o = x as Record<string, unknown>;
+    return typeof o === 'object' && o !== null && typeof o.title === 'string'
+      && typeof o.thumb === 'string' && typeof o.addedAt === 'string'
+      && (o.kind === 'movie' || o.kind === 'show')
+      && (typeof o.year === 'number' || o.year === null)
+      && typeof o.id === 'number';
+  };
+  const railOk = (rail: unknown, itemOk: (x: unknown) => boolean): boolean =>
+    rail === null || (Array.isArray(rail) && rail.every(itemOk));
+  return railOk(s.albums, albumOk) && railOk(s.videos, videoOk);
+}
+
+/** One popup load's landed sections: a field is present only when its call
+ * actually succeeded, so a rendered fallback can never pose as data. */
+export interface ServerCardFresh {
+  stats?: ServerStats;
+  wishlistCount?: number;
+  videoStats?: VideoStats | null;
+  albums?: RecentAlbum[];
+  videos?: RecentVideo[];
+}
+
+/**
+ * Merge a load's landed sections over the previous snapshot. Returns null
+ * when no complete snapshot can be formed — the counts are the card's
+ * core, so stats and the wishlist count must be fresh or carried; the
+ * rails never block a save (a server that 404s the video routes would
+ * otherwise disable the instant paint forever). Nothing landed at all
+ * also returns null: a merge with no fresh section is not worth a write.
+ */
+export function mergeServerCardSnapshot(
+  snap: ServerCardSnapshot | null,
+  fresh: ServerCardFresh,
+  url: string,
+  now: number,
+): ServerCardSnapshot | null {
+  const stats = fresh.stats ?? snap?.stats;
+  if (!stats) return null;
+  const wishlistCount = fresh.wishlistCount ?? snap?.wishlistCount;
+  if (wishlistCount === undefined) return null;
+  const videoStats = fresh.videoStats !== undefined ? fresh.videoStats : snap?.videoStats;
+  if (videoStats === undefined) return null;
+  const anythingLanded = fresh.stats !== undefined || fresh.albums !== undefined
+    || fresh.videos !== undefined || fresh.wishlistCount !== undefined
+    || fresh.videoStats !== undefined;
+  if (!anythingLanded) return null;
+  return {
+    url,
+    savedAt: now,
+    statsSavedAt: fresh.stats ? now : (snap?.statsSavedAt ?? now),
+    stats,
+    wishlistCount,
+    videoStats,
+    albums: fresh.albums ?? snap?.albums ?? null,
+    videos: fresh.videos ?? snap?.videos ?? null,
+  };
 }
 
 export interface VideoSearchHit {

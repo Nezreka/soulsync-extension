@@ -6,12 +6,15 @@ import {
   addToWishlist,
   BADGES_ENABLED_KEY,
   badgesEnabledFromStored,
+  connectionHint,
   describeReleaseResult,
   directArtwork,
   getConfig,
   getRecentlyAdded,
   getRecentlyAddedVideos,
   getVideoStats,
+  isServerCardSnapshot,
+  mergeServerCardSnapshot,
   getServerStats,
   getWishlistCount,
   importToPlaylist,
@@ -25,6 +28,8 @@ import {
   type RecentAlbum,
   type RecentVideo,
   type VideoStats,
+  type ServerCardFresh,
+  type ServerCardSnapshot,
   type ServerStats,
   type TrackHit,
 } from '../shared/api.js';
@@ -653,41 +658,146 @@ function renderVideoRail(cfg: ServerConfig, videos: RecentVideo[]): void {
 }
 
 /** Shimmer placeholders shown in the server card while it loads. */
+function renderRailSkeleton(el: HTMLElement): void {
+  el.innerHTML = '<div class="skel-rail"><div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div></div>';
+}
+
 function renderServerSkeleton(): void {
   const stats = $('server-stats');
   stats.innerHTML = '<div class="skel-stats"><div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div></div>';
-  const rail = $('recent-rail');
-  rail.innerHTML = '<div class="skel-rail"><div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div></div>';
-  const vrail = $('recent-video-rail');
-  vrail.innerHTML = '<div class="skel-rail"><div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div></div>';
+  renderRailSkeleton($('recent-rail'));
+  renderRailSkeleton($('recent-video-rail'));
+}
+
+/* ── server card snapshot: last good data, painted instantly ── */
+
+const SERVER_CARD_CACHE_KEY = 'soulsync_server_card';
+
+async function loadServerCardSnapshot(forUrl: string): Promise<ServerCardSnapshot | null> {
+  try {
+    const stored = (await browser.storage.local.get(SERVER_CARD_CACHE_KEY)) as Record<string, unknown>;
+    const snap: unknown = stored[SERVER_CARD_CACHE_KEY];
+    // Storage survives extension updates: a snapshot written by another
+    // version is shape-checked before anything paints from it, or a
+    // drifted shape would crash the paint on every open, forever.
+    if (isServerCardSnapshot(snap) && snap.url === forUrl) return snap;
+  } catch {
+    /* the snapshot is a nicety, never a failure */
+  }
+  return null;
+}
+
+async function saveServerCardSnapshot(snap: ServerCardSnapshot): Promise<void> {
+  try {
+    await browser.storage.local.set({ [SERVER_CARD_CACHE_KEY]: snap });
+  } catch {
+    /* same: a lost save only costs the next open its instant paint */
+  }
 }
 
 /**
- * Load the server card. The card appears immediately with a skeleton shimmer
- * and fills in when the data lands; on failure it hides again.
+ * Load the server card. The last good snapshot for this server paints
+ * instantly (a skeleton shimmer when there is none yet), then each section
+ * is replaced as its own data lands — the library stats count can take
+ * seconds on a big library, and it must not hold the rails hostage while
+ * it runs. Only the stats call decides whether the card shows at all; a
+ * failed refresh leaves the snapshot up rather than vanishing the card.
  */
 async function loadServerExtras(): Promise<void> {
   if (!cfg) return;
+  const myCfg = cfg;
   $('server-card').hidden = false;
-  renderServerSkeleton();
-  // Only the stats call decides whether the card shows. The rails and the
-  // counts degrade on their own: a music-only server (no video library) or
-  // one slow endpoint must not take the whole card down with it.
-  const [stats, albums, videos, wishlistCount, videoStats] = await Promise.allSettled([
-    getServerStats(cfg),
-    getRecentlyAdded(cfg, 12),
-    getRecentlyAddedVideos(cfg, 12),
-    getWishlistCount(cfg),
-    getVideoStats(cfg),
-  ]);
-  if (stats.status === 'rejected') {
-    $('server-card').hidden = true;
-    return;
+
+  const snap = await loadServerCardSnapshot(myCfg.url);
+  let painted = false;
+  if (snap) {
+    try {
+      renderStats(snap.stats, snap.wishlistCount, snap.videoStats);
+      // A rail that has never landed for this server stays a skeleton
+      // until its data arrives; painting it as empty would be a guess.
+      if (snap.albums) renderRail(myCfg, snap.albums);
+      else renderRailSkeleton($('recent-rail'));
+      if (snap.videos) renderVideoRail(myCfg, snap.videos);
+      else renderRailSkeleton($('recent-video-rail'));
+      // Say it's saved data from the start, not only once the refresh has
+      // failed: the refresh can take a while, and the download pill in
+      // particular reads as live status.
+      $('server-last-update').textContent =
+        `saved data from ${relativeTime(snap.statsSavedAt)} · refreshing…`;
+      painted = true;
+    } catch {
+      painted = false;
+    }
   }
-  const ok = <T,>(r: PromiseSettledResult<T>, fallback: T): T => (r.status === 'fulfilled' ? r.value : fallback);
-  renderStats(stats.value, ok(wishlistCount, 0), ok(videoStats, null));
-  renderRail(cfg, ok(albums, [] as RecentAlbum[]));
-  renderVideoRail(cfg, ok(videos, [] as RecentVideo[]));
+  if (!painted) renderServerSkeleton();
+
+  // Only sections whose calls actually landed enter `fresh`; a fallback
+  // rendered for a failed call (a 0, an empty rail) is never persisted as
+  // if it were last good data. Each section persists the merge as soon as
+  // it lands (serialized through one chain), so closing the popup during
+  // a slow stats call doesn't throw away rails that already arrived.
+  const fresh: ServerCardFresh = {};
+  let persistChain: Promise<void> = Promise.resolve();
+  const persist = (): Promise<void> => {
+    persistChain = persistChain.then(async () => {
+      const merged = mergeServerCardSnapshot(snap, fresh, myCfg.url, Date.now());
+      if (merged) await saveServerCardSnapshot(merged);
+    });
+    return persistChain;
+  };
+  const statsDone = (async (): Promise<void> => {
+    const [stats, wishlistCount, videoStats] = await Promise.allSettled([
+      getServerStats(myCfg),
+      getWishlistCount(myCfg),
+      getVideoStats(myCfg),
+    ]);
+    if (stats.status === 'rejected') {
+      if (!painted) {
+        $('server-card').hidden = true;
+      } else if (snap) {
+        // The snapshot stays up, but it says so: without this the card
+        // would present days-old counts as if they were live.
+        $('server-last-update').textContent =
+          `couldn't refresh — showing saved data from ${relativeTime(snap.statsSavedAt)}`;
+      }
+      return;
+    }
+    if (wishlistCount.status === 'fulfilled') fresh.wishlistCount = wishlistCount.value;
+    if (videoStats.status === 'fulfilled') fresh.videoStats = videoStats.value;
+    fresh.stats = stats.value;
+    renderStats(
+      stats.value,
+      fresh.wishlistCount ?? snap?.wishlistCount ?? 0,
+      fresh.videoStats !== undefined ? fresh.videoStats : (snap?.videoStats ?? null),
+    );
+    if (snap && (wishlistCount.status === 'rejected' || videoStats.status === 'rejected')) {
+      // The counts just rendered include saved values; the line says so.
+      $('server-last-update').textContent += ' · some counts saved';
+    }
+    await persist();
+  })();
+  const albumsDone = (async (): Promise<void> => {
+    try {
+      fresh.albums = await getRecentlyAdded(myCfg, 12);
+      renderRail(myCfg, fresh.albums);
+      await persist();
+    } catch {
+      // Painted-but-null rail (never landed for this server) also gets the
+      // empty state, or its skeleton would shimmer for the whole open.
+      // The fallback is painted only — never persisted as data.
+      if (!painted || !snap?.albums) renderRail(myCfg, []);
+    }
+  })();
+  const videosDone = (async (): Promise<void> => {
+    try {
+      fresh.videos = await getRecentlyAddedVideos(myCfg, 12);
+      renderVideoRail(myCfg, fresh.videos);
+      await persist();
+    } catch {
+      if (!painted || !snap?.videos) renderVideoRail(myCfg, []);
+    }
+  })();
+  await Promise.allSettled([statsDone, albumsDone, videosDone]);
 }
 
 /* ── tabs ── */
@@ -1502,7 +1612,7 @@ async function mediaSearch(): Promise<void> {
     state.textContent = totalRows === 0 ? 'Nothing in your library matched.' : '';
   } catch (e) {
     if (reqId !== mediaReqId) return;
-    state.textContent = `Couldn’t reach your server — ${e instanceof Error ? e.message : String(e)}`;
+    state.textContent = `Couldn’t reach your server — ${connectionHint(cfg, e).message}`;
   }
 }
 
