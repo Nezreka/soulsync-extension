@@ -11,6 +11,25 @@ export interface NowPlaying {
   album: string;
   /** best artwork URL the page exposed; may be "" */
   artwork: string;
+  /** page URL of the PLAYING track, when the page exposes it (SoundCloud's
+   *  player bar) — it can differ from the tab URL while the user browses */
+  sourceUrl?: string;
+  /** track length, when the page exposes it */
+  durationMs?: number;
+}
+
+/** One SoundCloud upload the user may add as an exact wishlist entry. */
+export interface ExactUploadDraft {
+  /** normalized track URL (public permalink or /s- private link) */
+  url: string;
+  /** the upload's title as SoundCloud shows it */
+  title: string;
+  /** the uploader's display name — not necessarily the artist */
+  uploader: string;
+  artwork: string;
+  durationMs: number;
+  /** SoundCloud's numeric track id, when the page exposed it */
+  scId?: string;
 }
 
 export interface ParsedTrack {

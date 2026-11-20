@@ -708,3 +708,22 @@
   font-size: 12px;
   border-radius: 8px;
 }
+
+/* Exact SoundCloud upload — compact tag form (title / artists / remixer /
+   playlist) above the add button. Inputs reuse the artist-search field. */
+.ssb-exact-form {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+}
+
+.ssb-exact-form select.ssb-artist-search-input {
+  appearance: auto;
+}
+
+.ssb-exact-note {
+  font-size: 11.5px;
+  color: #8b949e;
+  padding: 0 2px;
+}

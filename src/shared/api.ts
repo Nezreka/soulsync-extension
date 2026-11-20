@@ -3,6 +3,13 @@ import type { ReleaseInfo, ServerConfig } from './types.js';
 import { libraryId, mapLibraryTrack, type LibraryId, type LibraryTrack } from './player-api.js';
 import { serverFetch } from './http.js';
 import { splitArtists } from './youtube.js';
+import {
+  exactErrorMessage,
+  isUnsupportedStatus,
+  UNSUPPORTED_SERVER_MESSAGE,
+  type ExactAddRequest,
+  type ExactState,
+} from './soundcloud.js';
 
 /**
  * SoulSync server client.
@@ -21,6 +28,12 @@ import { splitArtists } from './youtube.js';
  *   (the wishlist pipeline IS the download pipeline — no separate download call)
  * - POST /api/v1/playlists/<id>/sync  {playlist_name, tracks: [{name, artists[], album}], sync_mode?}
  * - GET  /api/v1/playlists      list only (used as the cheap auth check)
+ * - GET  /api/v1/soundcloud/exact[?sc_id=|url=]  exact-upload probe + status
+ *   GET  /api/v1/soundcloud/exact/playlists     SoulSync user playlists
+ *   POST /api/v1/soundcloud/exact  {url, title?, artists?, remixers?, playlist_id?}
+ *   -> 201/200 {created, state, track_id, upload, track, playlist}. Newer
+ *   servers only: 404/405 on these routes = the server doesn't support exact
+ *   uploads (UnsupportedServerError), never a plain failure.
  */
 
 const V1 = '/api/v1';
@@ -583,6 +596,217 @@ export async function importToPlaylist(
       sync_mode: 'append',
     }),
   });
+}
+
+/* ── exact SoundCloud uploads ── */
+
+/** The server predates the exact-upload routes (it answered 404/405). */
+export class UnsupportedServerError extends Error {
+  constructor() {
+    super(UNSUPPORTED_SERVER_MESSAGE);
+    this.name = 'UnsupportedServerError';
+  }
+}
+
+/**
+ * Like apiFetchEnvelope, but never throws on the HTTP status: capability
+ * detection needs the status itself (an older server answers an unknown v1
+ * route with the SPA catch-all's bare 404, or 405 for a POST — no envelope).
+ * Transport failures still throw.
+ */
+async function apiFetchWithStatus(
+  cfg: ServerConfig,
+  path: string,
+  init: RequestInit = {},
+): Promise<{ status: number; envelope: Envelope }> {
+  const res = await serverFetch(baseUrl(cfg) + path, {
+    ...init,
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${cfg.apiKey}`,
+      ...(init.headers || {}),
+    },
+  });
+  const envelope = (await res.json().catch(() => ({}))) as Envelope;
+  return { status: res.status, envelope };
+}
+
+function envelopeError(status: number, envelope: Envelope): { code: string; message: string } {
+  const err = envelope.error;
+  if (typeof err === 'string') return { code: '', message: err };
+  return { code: err?.code ?? '', message: err?.message || `Server returned ${status}` };
+}
+
+/** Success needs the envelope's own flag: a 2xx without it (a proxy page,
+ *  an SPA fallback) never reached the exact routes. */
+function isOk(status: number, envelope: Envelope): boolean {
+  return status >= 200 && status < 300 && envelope.success === true;
+}
+
+/** A 2xx with no envelope at all — the probe/status read it as a server
+ *  without the exact routes, like a missing `supported` flag. */
+function isBare2xx(status: number, envelope: Envelope): boolean {
+  return status >= 200 && status < 300 && envelope.success === undefined;
+}
+
+export type ExactSupport = { supported: false } | { supported: true; enabled: boolean; reason: string | null };
+
+export interface ExactStatus {
+  enabled: boolean;
+  /** 'source_disabled' | 'source_unavailable' when enabled is false */
+  reason: string | null;
+  state: ExactState;
+  matched: boolean;
+  trackId: string | null;
+  failureReason: string | null;
+  retryCount: number;
+  lastAttempted: string | null;
+}
+
+const EXACT_PATH = `${V1}/soundcloud/exact`;
+const EXACT_STATES: ReadonlySet<string> = new Set(['none', 'queued', 'failed', 'downloading', 'acquired']);
+
+function strOrNull(v: unknown): string | null {
+  return typeof v === 'string' && v ? v : null;
+}
+
+/**
+ * Capability probe: GET /api/v1/soundcloud/exact with no query (no network
+ * on the server side). 404/405 → unsupported, whatever the body; any other
+ * failure is a normal error.
+ */
+export async function soundcloudExactSupport(cfg: ServerConfig): Promise<ExactSupport> {
+  const { status, envelope } = await apiFetchWithStatus(cfg, EXACT_PATH, { method: 'GET' });
+  if (isUnsupportedStatus(status) || isBare2xx(status, envelope)) return { supported: false };
+  if (!isOk(status, envelope)) throw new Error(envelopeError(status, envelope).message);
+  const data = envelope.data ?? {};
+  if (data.supported !== true) return { supported: false };
+  return { supported: true, enabled: data.enabled !== false, reason: strOrNull(data.reason) };
+}
+
+/** Status of one exact upload, by SoundCloud id or by URL (no network on
+ *  the server side). Throws UnsupportedServerError on an older server. */
+export async function getExactSoundcloudStatus(
+  cfg: ServerConfig,
+  q: { scId?: string; url?: string },
+): Promise<ExactStatus> {
+  const params = new URLSearchParams();
+  if (q.scId) params.set('sc_id', q.scId);
+  if (q.url) params.set('url', q.url);
+  const qs = params.toString();
+  const { status, envelope } = await apiFetchWithStatus(cfg, qs ? `${EXACT_PATH}?${qs}` : EXACT_PATH, {
+    method: 'GET',
+  });
+  if (isUnsupportedStatus(status) || isBare2xx(status, envelope)) throw new UnsupportedServerError();
+  if (!isOk(status, envelope)) throw new Error(envelopeError(status, envelope).message);
+  const d = envelope.data ?? {};
+  if (d.supported !== true) throw new UnsupportedServerError();
+  const state = typeof d.state === 'string' && EXACT_STATES.has(d.state) ? (d.state as ExactState) : 'none';
+  return {
+    enabled: d.enabled !== false,
+    reason: strOrNull(d.reason),
+    state,
+    matched: d.matched === true,
+    trackId: strOrNull(d.track_id),
+    failureReason: strOrNull(d.failure_reason),
+    retryCount: typeof d.retry_count === 'number' ? d.retry_count : 0,
+    lastAttempted: strOrNull(d.last_attempted),
+  };
+}
+
+export interface ExactPlaylist {
+  id: number;
+  name: string;
+  trackCount: number;
+  liked: boolean;
+}
+
+/** The profile's own SoulSync playlists — the only ones an exact upload
+ *  can join (upstream mirrors are rewritten on refresh). */
+export async function getExactSoundcloudPlaylists(cfg: ServerConfig): Promise<ExactPlaylist[]> {
+  const { status, envelope } = await apiFetchWithStatus(cfg, `${EXACT_PATH}/playlists`, { method: 'GET' });
+  if (isUnsupportedStatus(status)) throw new UnsupportedServerError();
+  if (!isOk(status, envelope)) throw new Error(envelopeError(status, envelope).message);
+  const list = envelope.data?.playlists;
+  if (!Array.isArray(list)) return [];
+  return list
+    .map((it: unknown) => {
+      const o = (it ?? {}) as Record<string, unknown>;
+      return {
+        id: typeof o.id === 'number' ? o.id : 0,
+        name: typeof o.name === 'string' && o.name ? o.name : 'Untitled',
+        trackCount: typeof o.track_count === 'number' ? o.track_count : 0,
+        liked: o.liked === true,
+      };
+    })
+    .filter((p) => p.id > 0);
+}
+
+export interface ExactUpload {
+  scId: string;
+  permalinkUrl: string;
+  title: string;
+  uploader: string;
+  durationMs: number;
+  artworkUrl: string;
+  officialDownload: boolean;
+}
+
+export interface ExactAddResult {
+  /** false when the row already existed (refreshed) or is already acquired */
+  created: boolean;
+  state: ExactState;
+  trackId: string;
+  upload: ExactUpload | null;
+  /** null when no playlist was requested */
+  playlist: { id: number; name: string; added: boolean; alreadyPresent: boolean; error: string | null } | null;
+}
+
+/**
+ * Wishlist one exact SoundCloud upload: POST /api/v1/soundcloud/exact. The
+ * server resolves the link itself and never searches the catalogue.
+ * Throws UnsupportedServerError on 404/405, and an Error carrying user text
+ * (exactErrorMessage) for every other refusal.
+ */
+export async function addExactSoundcloudTrack(cfg: ServerConfig, req: ExactAddRequest): Promise<ExactAddResult> {
+  const { status, envelope } = await apiFetchWithStatus(cfg, EXACT_PATH, {
+    method: 'POST',
+    body: JSON.stringify(req),
+  });
+  if (isUnsupportedStatus(status)) throw new UnsupportedServerError();
+  if (!isOk(status, envelope)) {
+    const { code, message } = envelopeError(status, envelope);
+    throw new Error(exactErrorMessage(code, message));
+  }
+  const d = envelope.data ?? {};
+  const u = d.upload && typeof d.upload === 'object' ? (d.upload as Record<string, unknown>) : null;
+  const p = d.playlist && typeof d.playlist === 'object' ? (d.playlist as Record<string, unknown>) : null;
+  const state = typeof d.state === 'string' && EXACT_STATES.has(d.state) ? (d.state as ExactState) : 'queued';
+  return {
+    created: d.created === true,
+    state,
+    trackId: typeof d.track_id === 'string' ? d.track_id : '',
+    upload: u
+      ? {
+          scId: String(u.sc_id ?? ''),
+          permalinkUrl: typeof u.permalink_url === 'string' ? u.permalink_url : '',
+          title: typeof u.title === 'string' ? u.title : '',
+          uploader: typeof u.uploader === 'string' ? u.uploader : '',
+          durationMs: typeof u.duration_ms === 'number' ? u.duration_ms : 0,
+          artworkUrl: typeof u.artwork_url === 'string' ? u.artwork_url : '',
+          officialDownload: u.official_download === true,
+        }
+      : null,
+    playlist: p
+      ? {
+          id: typeof p.id === 'number' ? p.id : 0,
+          name: typeof p.name === 'string' ? p.name : '',
+          added: p.added === true,
+          alreadyPresent: p.already_present === true,
+          error: strOrNull(p.error),
+        }
+      : null,
+  };
 }
 
 /* ── page badges ── */

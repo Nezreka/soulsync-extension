@@ -357,6 +357,28 @@ button.slim { padding-top: 9px; padding-bottom: 9px; font-size: 13.5px; }
 #np-wrong-match { color: var(--muted); }
 #np-wrong-match:hover { color: var(--text); background: var(--surface-2); }
 
+/* ── exact SoundCloud upload ────────────────────────────────────── */
+.np-exact { margin-top: 12px; }
+.np-exact[hidden], #np-exact-form[hidden], #np-exact-hint[hidden] { display: none; }
+.np-exact .tags:empty { display: none; }
+.np-exact-staterow {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0 6px;
+}
+.np-exact-staterow[hidden] { display: none; }
+#np-exact-state { flex: 1; min-width: 0; }
+#np-exact-remove { font-size: 11px; color: var(--muted); }
+#np-exact-remove:hover { color: var(--text); background: var(--surface-2); }
+#np-exact-hint { margin-top: 6px; }
+#np-exact-form { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.np-exact-field { display: flex; flex-direction: column; gap: 3px; }
+.np-exact-field input, .np-exact-field select { width: 100%; }
+.tag-dl { background: rgba(48, 209, 88, 0.13); border-color: rgba(48, 209, 88, 0.3); color: #7ee2a0; }
+.tag-fail { background: rgba(255, 69, 58, 0.13); border-color: rgba(255, 69, 58, 0.3); color: #ffb3ad; }
+
 #np-match-panel { margin-top: 10px; }
 .match-row {
   display: flex;

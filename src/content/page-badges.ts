@@ -22,6 +22,15 @@ import {
   type LibraryTrack,
 } from '../shared/api.js';
 import { sendToPlayer } from '../player/messaging.js';
+import {
+  EXACT_PLAYLISTS_FAILED,
+  exactDisabledMessage,
+  exactStateLabel,
+  parseSoundcloudUrl,
+  scIdFromAppUrl,
+  splitScTitle,
+  UNSUPPORTED_SERVER_MESSAGE,
+} from '../shared/soundcloud.js';
 
 /**
  * Page badges: tiny library-status pills next to artist/album names.
@@ -84,6 +93,9 @@ interface Candidate {
    *  "Artist - Track" shape): the pill is a 🔍 that opens manual search
    *  instead of a guessed watchlist add. Never offer watchlist for this. */
   manualSearch?: boolean;
+  /** SoundCloud track page: the pill is about THIS upload (exact add,
+   *  exact status) — never a library-by-name lookup or a catalogue add. */
+  exactSoundcloud?: { url: string; scId?: string };
 }
 
 type PillState = 'loading' | 'in' | 'out' | 'unknown' | 'acted';
@@ -103,7 +115,19 @@ type PillVisual =
   | 'manual-search'
   | 'save'
   | 'saved'
-  | 'save-failed';
+  | 'save-failed'
+  | 'exact';
+
+/** Server answer for an exact-SoundCloud candidate (sc-exact-status). */
+interface ExactRec {
+  /** 'unsupported': the server predates exact uploads; 'error': unknown */
+  status: 'ok' | 'unsupported' | 'error';
+  enabled: boolean;
+  reason: string | null;
+  state: string;
+  failureReason: string | null;
+  error?: string;
+}
 
 interface BadgeRec {
   pill: HTMLButtonElement;
@@ -136,6 +160,8 @@ interface BadgeRec {
   popLayer: HTMLElement | null;
   /** Honest save-failure message for the playlist pill's title (retry). */
   saveError?: string;
+  /** Exact-SoundCloud status, for candidates with exactSoundcloud. */
+  exact?: ExactRec;
 }
 
 const HOST_ATTR = 'data-ssb';
@@ -158,8 +184,11 @@ const savedPlaylistKeys = new Set<string>();
 const badges = new Map<HTMLElement, BadgeRec>();
 
 function badgeKeyFor(
-  c: Pick<Candidate, 'kind' | 'name' | 'artist' | 'playlistSource' | 'playlistId'>,
+  c: Pick<Candidate, 'kind' | 'name' | 'artist' | 'playlistSource' | 'playlistId' | 'exactSoundcloud'>,
 ): string {
+  // Exact uploads key on the upload's link — never shared with a catalogue
+  // track of the same name.
+  if (c.exactSoundcloud) return `sc-exact:${c.exactSoundcloud.url}`;
   // Playlists key on the native provider ID — two playlists can share a name.
   if (c.kind === 'playlist') return `playlist:${c.playlistSource ?? ''}:${c.playlistId ?? ''}`;
   // Must match api.ts badgeKey exactly: kind + normalized "artist name".
@@ -1212,10 +1241,66 @@ function playlistCandidates(): Candidate[] {
   return out;
 }
 
+/** A meta tag's content, by property= or name= (SoundCloud mixes both). */
+function metaContent(key: string): string {
+  return (
+    document
+      .querySelector(`meta[property="${key}"], meta[name="${key}"]`)
+      ?.getAttribute('content')
+      ?.trim() ?? ''
+  );
+}
+
+/**
+ * SoundCloud track pages: one primary candidate for the exact upload. Sets,
+ * profiles and every other page keep the generic album/artist extractor.
+ * Meta tags can be left over from the previous page after an SPA
+ * navigation, so the numeric id (and og:title) are trusted only when
+ * og:url / the canonical link names the page actually shown.
+ */
+function soundcloudCandidates(): Candidate[] {
+  const page = parseSoundcloudUrl(location.href);
+  if (page.kind !== 'track') return genericCandidates();
+  const anchor =
+    document.querySelector('.fullHero__title .soundTitle__title') ?? document.querySelector('h1');
+  if (!anchor) return [];
+  const canonical =
+    metaContent('og:url') ||
+    (document.querySelector('link[rel="canonical"]')?.getAttribute('href') ?? '');
+  const metaFresh = (() => {
+    const meta = parseSoundcloudUrl(canonical);
+    // A private /s- page's canonical link may drop the token: compare the
+    // user/slug path only.
+    return meta.kind === 'track' && meta.user === page.user && meta.slug === page.slug;
+  })();
+  const scId = metaFresh
+    ? (scIdFromAppUrl(metaContent('al:ios:url')) ?? scIdFromAppUrl(metaContent('twitter:app:url:iphone')))
+    : null;
+  const name = ((metaFresh ? metaContent('og:title') : '') || (anchor.textContent ?? '')).trim();
+  const uploader = (
+    document.querySelector('.fullHero__title .soundTitle__username')?.textContent ??
+    (metaFresh ? metaContent('twitter:audio:artist_name') : '')
+  ).trim();
+  if (!name) return [];
+  return [
+    {
+      kind: 'track',
+      name,
+      artist: uploader || page.user,
+      anchor,
+      pageUrl: location.href,
+      primary: true,
+      provider: 'soundcloud',
+      exactSoundcloud: { url: page.url, ...(scId ? { scId } : {}) },
+    },
+  ];
+}
+
 function collectCandidates(): Candidate[] {
   if (location.hostname === 'open.spotify.com') return spotifyCandidates();
   if (location.hostname.includes('deezer')) return deezerCandidates();
   if (isBadgedYoutubeHost(location.hostname)) return youtubeCandidates();
+  if (location.hostname.includes('soundcloud')) return soundcloudCandidates();
   return genericCandidates();
 }
 
@@ -1303,6 +1388,12 @@ function mountBadge(c: Candidate): HTMLElement {
       } else if (r.visual === 'unknown') {
         dropBadge(host, r);
       }
+      return;
+    }
+    // Exact SoundCloud upload: every state opens the card (status, tag form,
+    // the exact add) — never the by-name play or catalogue wishlist.
+    if (c.exactSoundcloud) {
+      togglePopover(host);
       return;
     }
     // Mini watchlist eye: one click adds (no modal, no popover); once
@@ -1671,6 +1762,8 @@ function setPillState(host: HTMLElement, visual: Exclude<PillVisual, 'loading'>)
     pill.title = rec.saveError ?? `${name} — save failed. Click to retry.`;
     pill.setAttribute('aria-label', `${name}: save failed. Click to retry.`);
     pill.innerHTML = '<span aria-hidden="true">⚠</span><span>Save failed</span>';
+  } else if (visual === 'exact') {
+    setExactPill(pill, name, rec.exact);
   } else if (visual === 'unknown') {
     pill.className = `ssb-pill ssb-unknown${miniCls}`;
     pill.title = "Couldn't check your SoulSync library";
@@ -1686,6 +1779,44 @@ function setPillState(host: HTMLElement, visual: Exclude<PillVisual, 'loading'>)
     pill.setAttribute('aria-label', `${name}: not in your library. Add to wishlist.`);
     pill.innerHTML = `<span aria-hidden="true">+</span><span>${label}</span>`;
   }
+}
+
+/** Pill for an exact SoundCloud upload, from its server state. */
+function setExactPill(pill: HTMLButtonElement, name: string, ex: ExactRec | undefined): void {
+  const show = (cls: string, icon: string, label: string, title: string): void => {
+    pill.className = `ssb-pill ${cls}`;
+    pill.title = title;
+    pill.setAttribute('aria-label', `${name}: ${title}`);
+    pill.textContent = '';
+    const i = document.createElement('span');
+    i.setAttribute('aria-hidden', 'true');
+    i.textContent = icon;
+    const l = document.createElement('span');
+    l.textContent = label;
+    pill.append(i, l);
+  };
+  if (!ex || ex.status !== 'ok') {
+    pill.className = 'ssb-pill ssb-unknown';
+    pill.title =
+      ex?.status === 'unsupported' ? UNSUPPORTED_SERVER_MESSAGE : "Couldn't check this upload on your SoulSync server";
+    pill.setAttribute('aria-label', `${name}: ${pill.title}`);
+    pill.textContent = '?';
+    return;
+  }
+  const line = exactStateLabel(ex.state, ex.failureReason).line;
+  if (ex.state === 'acquired') show('ssb-in', '✓', 'In library', line);
+  else if (ex.state === 'queued') show('ssb-acted', '✓', 'Queued', line);
+  else if (ex.state === 'downloading') show('ssb-acted', '↓', 'Downloading', line);
+  else if (ex.state === 'failed') show('ssb-save-failed', '⚠', 'Failed', line);
+  else
+    show(
+      'ssb-out',
+      '+',
+      'Exact upload',
+      ex.enabled
+        ? 'Not on your wishlist. Click to add this exact SoundCloud upload.'
+        : exactDisabledMessage(ex.reason),
+    );
 }
 
 function closePopover(rec: BadgeRec): void {
@@ -2473,6 +2604,11 @@ function togglePopover(host: HTMLElement): void {
   // show library state.
   const status = pop.querySelector('.ssb-card-status');
   const actions = pop.querySelector('.ssb-card-actions');
+  if (c.exactSoundcloud) {
+    insertExactSoundcloud(rec, pop, status, actions);
+    insertPop(rec, pop);
+    return;
+  }
   if (c.kind === 'artist' && !c.manualSearch) {
     const names = c.artists && c.artists.length > 0 ? c.artists : [c.name];
     const states = names.map((n) => rec.watchStates[normName(n)] ?? null);
@@ -2613,6 +2749,150 @@ function togglePopover(host: HTMLElement): void {
   insertPop(rec, pop);
 }
 
+/** Text input for the exact-upload form. Keys stay inside the card so the
+ *  page's own shortcuts (SoundCloud: space = play/pause, L = like) don't
+ *  fire while typing. */
+function exactInput(placeholder: string, value: string): HTMLInputElement {
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'ssb-artist-search-input';
+  input.placeholder = placeholder;
+  input.setAttribute('aria-label', placeholder);
+  input.autocomplete = 'off';
+  input.spellcheck = false;
+  input.value = value;
+  for (const ev of ['keydown', 'keypress', 'keyup'] as const) {
+    input.addEventListener(ev, (e) => e.stopPropagation());
+  }
+  return input;
+}
+
+/**
+ * The exact-SoundCloud card: honest status, then a compact tag form (title,
+ * artists, remixer, playlist) whose button adds THIS upload. Unsupported
+ * servers and a disabled SoundCloud source get the reason, no button.
+ */
+function insertExactSoundcloud(
+  rec: BadgeRec,
+  pop: HTMLDivElement,
+  status: Element | null,
+  actions: Element | null,
+): void {
+  const c = rec.candidate;
+  const ex = rec.exact;
+  const setStatus = (text: string, cls: string): void => {
+    if (!status) return;
+    status.textContent = text;
+    status.classList.add(cls);
+  };
+  if (!ex || ex.status === 'error') {
+    setStatus(ex?.error || "Couldn't check this upload on your SoulSync server", 'ssb-unknown');
+  } else if (ex.status === 'unsupported') {
+    setStatus(UNSUPPORTED_SERVER_MESSAGE, 'ssb-unknown');
+    return;
+  } else if (!ex.enabled) {
+    setStatus(exactDisabledMessage(ex.reason), 'ssb-unknown');
+    return;
+  } else {
+    const line = exactStateLabel(ex.state, ex.failureReason).line;
+    setStatus(
+      line || 'Not on your wishlist — add this exact upload.',
+      ex.state === 'acquired' ? 'ssb-in' : 'ssb-out',
+    );
+  }
+  const split = splitScTitle(c.name, c.artist ?? '');
+  const form = document.createElement('div');
+  form.className = 'ssb-exact-form';
+  const title = exactInput('Title', split.title);
+  const artists = exactInput('Artist(s), comma-separated', split.artist);
+  const remixers = exactInput('Remixer (optional)', '');
+  const note = document.createElement('div');
+  note.className = 'ssb-exact-note';
+  note.textContent = `Uploaded by ${c.artist || 'unknown'}`;
+  const playlist = document.createElement('select');
+  playlist.className = 'ssb-artist-search-input';
+  playlist.setAttribute('aria-label', 'Add to playlist');
+  const none = document.createElement('option');
+  none.value = '';
+  none.textContent = 'No playlist';
+  playlist.appendChild(none);
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'ssb-btn ssb-primary';
+  btn.textContent = '＋ Exact SoundCloud upload';
+  btn.addEventListener(
+    'click',
+    () =>
+      void onExactAdd(rec, btn, {
+        title: title.value,
+        artists: artists.value.split(','),
+        remixers: remixers.value.split(','),
+        playlistId: playlist.value ? Number(playlist.value) : undefined,
+      }),
+  );
+  form.append(title, artists, remixers, note, playlist, btn);
+  if (actions) actions.appendChild(form);
+  else pop.insertBefore(form, pop.querySelector('.ssb-err'));
+  void (async () => {
+    const res = await badgeAction(rec, { action: 'sc-exact-playlists' });
+    if (!playlist.isConnected) return;
+    if (!Array.isArray(res.playlists)) {
+      // retried the next time the popover opens (it rebuilds this form)
+      const failed = document.createElement('option');
+      failed.disabled = true;
+      failed.textContent = EXACT_PLAYLISTS_FAILED;
+      playlist.appendChild(failed);
+      return;
+    }
+    for (const p of res.playlists as { id?: unknown; name?: unknown; trackCount?: unknown }[]) {
+      if (typeof p.id !== 'number') continue;
+      const opt = document.createElement('option');
+      opt.value = String(p.id);
+      opt.textContent = `${String(p.name ?? '')} (${Number(p.trackCount) || 0})`;
+      playlist.appendChild(opt);
+    }
+  })();
+}
+
+async function onExactAdd(
+  rec: BadgeRec,
+  btn: HTMLButtonElement,
+  fields: { title: string; artists: string[]; remixers: string[]; playlistId?: number },
+): Promise<void> {
+  const ex = rec.candidate.exactSoundcloud;
+  if (!ex) return;
+  btn.dataset.label = btn.textContent ?? '';
+  btn.disabled = true;
+  btn.textContent = 'Adding…';
+  const done = await badgeAction(rec, { action: 'sc-exact-add', url: ex.url, ...fields });
+  if (done.unsupported) {
+    showError(rec, UNSUPPORTED_SERVER_MESSAGE);
+    btn.remove();
+    return;
+  }
+  if (done.error) {
+    showError(rec, String(done.error));
+    return;
+  }
+  const pl = done.playlist as { error?: unknown } | null | undefined;
+  rec.exact = {
+    status: 'ok',
+    enabled: true,
+    reason: null,
+    state: typeof done.state === 'string' ? done.state : 'queued',
+    failureReason: null,
+  };
+  const host = [...badges.entries()].find(([, r]) => r === rec)?.[0];
+  if (host) setPillState(host, 'exact');
+  if (pl?.error && rec.pop) {
+    // The wishlist add landed; only the playlist half failed — say so.
+    btn.remove();
+    showError(rec, `Queued, but adding it to the playlist failed: ${String(pl.error)}`);
+    return;
+  }
+  closePopover(rec);
+}
+
 const recServerUrl = new Map<HTMLElement, string>();
 
 /* ── scan lifecycle ── */
@@ -2629,6 +2909,8 @@ function dropBadge(host: HTMLElement, rec: BadgeRec): void {
 
 /** Individual artist names a candidate wants watch-checked. */
 function watchNamesFor(c: Candidate): string[] {
+  // An uploader is not a verified artist — no watch resolve for exact uploads.
+  if (c.exactSoundcloud) return [];
   if (c.artists && c.artists.length > 0) return c.artists;
   if (c.kind === 'artist') return [c.name];
   return c.artist ? [c.artist] : [];
@@ -2686,6 +2968,61 @@ async function resolvePlaylistSaved(c: Candidate, host: HTMLElement): Promise<vo
   rec.watchState = null;
   if (savedPlaylistKeys.has(key)) setPillState(host, 'saved');
   else setPillState(host, saved === true ? 'saved' : saved === false ? 'save' : 'unknown');
+}
+
+/** Exact-upload status for a SoundCloud track candidate (by link and the
+ *  page's numeric id), instead of the library-by-name lookup. */
+async function resolveExactSoundcloud(c: Candidate, host: HTMLElement): Promise<void> {
+  const ex = c.exactSoundcloud;
+  if (!ex) return;
+  const cfg = await getConfig().catch(() => null);
+  if (!cfg) {
+    // No server configured — same quiet take-down as resolveLibrary.
+    const early = badges.get(host);
+    if (early && early.candidate === c) {
+      badges.delete(host);
+      host.remove();
+      c.anchor.removeAttribute(HOST_ATTR);
+    }
+    return;
+  }
+  let r: Record<string, unknown>;
+  try {
+    r = (await browser.runtime.sendMessage({
+      type: 'SOULSYNC_BADGE_ACTION',
+      action: 'sc-exact-status',
+      url: ex.url,
+      ...(ex.scId ? { scId: ex.scId } : {}),
+    })) as Record<string, unknown>;
+  } catch {
+    r = { error: 'Could not reach the extension background.' };
+  }
+  const rec = badges.get(host);
+  if (!rec || rec.candidate !== c) return; // dropped or replaced since
+  recServerUrl.set(host, typeof r.serverUrl === 'string' ? r.serverUrl : cfg.url);
+  rec.libState = 'unknown';
+  rec.watchState = null;
+  if (r.unsupported) {
+    rec.exact = { status: 'unsupported', enabled: false, reason: null, state: 'none', failureReason: null };
+  } else if (r.error || typeof r.state !== 'string') {
+    rec.exact = {
+      status: 'error',
+      enabled: false,
+      reason: null,
+      state: 'none',
+      failureReason: null,
+      error: typeof r.error === 'string' ? r.error : undefined,
+    };
+  } else {
+    rec.exact = {
+      status: 'ok',
+      enabled: r.enabled !== false,
+      reason: typeof r.reason === 'string' ? r.reason : null,
+      state: r.state,
+      failureReason: typeof r.failureReason === 'string' ? r.failureReason : null,
+    };
+  }
+  setPillState(host, 'exact');
 }
 
 /** Per-item library lookup: renders this candidate's pill the moment its
@@ -2859,7 +3196,13 @@ async function scan(): Promise<void> {
   // already mounted, so badges pop in as they resolve. Playlist candidates
   // resolve through the mirror check, not the library lookup.
   fresh.forEach((c, i) =>
-    quiet(c.kind === 'playlist' ? resolvePlaylistSaved(c, hosts[i]) : resolveLibrary(c, hosts[i])),
+    quiet(
+      c.kind === 'playlist'
+        ? resolvePlaylistSaved(c, hosts[i])
+        : c.exactSoundcloud
+          ? resolveExactSoundcloud(c, hosts[i])
+          : resolveLibrary(c, hosts[i]),
+    ),
   );
   watchItems.forEach((item) => quiet(resolveWatch(item)));
 }

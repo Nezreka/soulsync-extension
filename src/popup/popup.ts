@@ -1,8 +1,18 @@
 import browser from 'webextension-polyfill';
-import type { NowPlaying, ParsedTrack, ReleaseInfo, ServerConfig } from '../shared/types.js';
+import type { ExactUploadDraft, NowPlaying, ParsedTrack, ReleaseInfo, ServerConfig } from '../shared/types.js';
 import { cleanNowPlaying } from '../shared/types.js';
 import { parseSelection } from '../shared/parse.js';
 import {
+  buildExactRequest,
+  exactDisabledMessage,
+  exactDraftFor,
+  exactStateLabel,
+  splitScTitle,
+  EXACT_PLAYLISTS_FAILED,
+  UNSUPPORTED_SERVER_MESSAGE,
+} from '../shared/soundcloud.js';
+import {
+  addExactSoundcloudTrack,
   addToWishlist,
   BADGES_ENABLED_KEY,
   badgesEnabledFromStored,
@@ -10,6 +20,8 @@ import {
   describeReleaseResult,
   directArtwork,
   getConfig,
+  getExactSoundcloudPlaylists,
+  getExactSoundcloudStatus,
   getRecentlyAdded,
   getRecentlyAddedVideos,
   getVideoStats,
@@ -23,8 +35,12 @@ import {
   removeFromWishlist,
   searchTracks,
   serverArtwork,
+  soundcloudExactSupport,
+  UnsupportedServerError,
   wishlistRelease,
   wishlistTrack,
+  type ExactAddResult,
+  type ExactSupport,
   type RecentAlbum,
   type RecentVideo,
   type VideoStats,
@@ -242,6 +258,9 @@ async function loadNowPlaying(): Promise<void> {
   const tab = await activeTab();
   const res = await askTab<{ nowPlaying: NowPlaying | null }>(tab?.id, 'SOULSYNC_GET_NOW_PLAYING');
   currentNp = res?.nowPlaying ? cleanNowPlaying(res.nowPlaying) : null;
+  // The exact-upload form works from the RAW media-session fields: on
+  // SoundCloud the "artist" is the uploader and the title is the upload's own.
+  prepareExact(res?.nowPlaying ?? null, tab?.url);
   $('np-empty').hidden = currentNp !== null;
   $('np-card').hidden = currentNp === null;
   if (!currentNp) return;
@@ -472,6 +491,237 @@ async function unwishlistCurrent(): Promise<void> {
     at: Date.now(),
   });
   setStatus(`Removed "${hit.title}" from your wishlist.`);
+}
+
+/* ── exact SoundCloud upload ──
+ * A separate action from the catalogue Wishlist button above: it wishlists
+ * THIS upload (the server resolves the link and downloads only that upload)
+ * and never searches the catalogue. */
+
+let exactDraft: ExactUploadDraft | null = null;
+/** null until the server answered the probe (or a status check). */
+let exactSupport: ExactSupport | null = null;
+/** wishlist id of the exact row, once the server named it */
+let exactTrackId: string | null = null;
+let exactPlaylistsLoaded = false;
+
+function isSoundcloudHost(url: string | undefined): boolean {
+  try {
+    return !!url && /(^|\.)soundcloud\.com$/i.test(new URL(url).hostname);
+  } catch {
+    return false;
+  }
+}
+
+function showExactHint(msg: string): void {
+  const hint = $('np-exact-hint');
+  hint.textContent = msg;
+  hint.hidden = !msg;
+}
+
+/** The action can't run (old server, SoundCloud off): say why, lock it. */
+function disableExact(msg: string): void {
+  ($('np-exact-toggle') as HTMLButtonElement).disabled = true;
+  $('np-exact-form').hidden = true;
+  showExactHint(msg);
+}
+
+function renderExactState(state: string, failureReason: string | null = null): void {
+  const label = exactStateLabel(state, failureReason);
+  const tags = $('np-exact-tags');
+  tags.innerHTML = '';
+  if (label.tag) tags.appendChild(makeTag(label.tag, label.cls));
+  $('np-exact-state').textContent = label.line;
+  $('np-exact-remove').hidden = !(state === 'failed' && exactTrackId);
+  $('np-exact-staterow').hidden = !label.line;
+}
+
+function prepareExact(np: NowPlaying | null, tabUrl: string | undefined): void {
+  exactDraft = exactDraftFor(np, tabUrl);
+  exactSupport = null;
+  exactTrackId = null;
+  exactPlaylistsLoaded = false;
+  const onSoundcloud = isSoundcloudHost(tabUrl) || !!np?.sourceUrl;
+  $('np-exact').hidden = !np || (!exactDraft && !onSoundcloud);
+  $('np-exact-form').hidden = true;
+  renderExactState('none');
+  const toggle = $('np-exact-toggle') as HTMLButtonElement;
+  if (!exactDraft) {
+    toggle.hidden = true;
+    showExactHint("Open the track's page to add the exact upload.");
+    return;
+  }
+  toggle.hidden = false;
+  toggle.disabled = false;
+  showExactHint('');
+  // A draft from the tab URL has no tags (the playing track's belong to
+  // another upload): the fields start empty and the server uses the
+  // upload's own title and uploader.
+  const tagged = !!(exactDraft.title || exactDraft.uploader);
+  const split = splitScTitle(exactDraft.title, exactDraft.uploader);
+  const titleIn = $('np-exact-title') as HTMLInputElement;
+  const artistsIn = $('np-exact-artists') as HTMLInputElement;
+  titleIn.value = split.title;
+  titleIn.placeholder = tagged ? '' : "Leave empty to use the upload's own title";
+  artistsIn.value = split.artist;
+  artistsIn.placeholder = tagged ? 'Comma-separated' : 'Comma-separated — empty uses the uploader';
+  ($('np-exact-remixers') as HTMLInputElement).value = '';
+  const link = exactDraft.url.replace(/^https:\/\//, '');
+  $('np-exact-uploader').textContent = tagged ? `Uploaded by ${exactDraft.uploader || 'unknown'} · ${link}` : link;
+  const sel = $('np-exact-playlist') as HTMLSelectElement;
+  sel.length = 1;
+}
+
+/** Status of this exact upload on the server (no network server-side).
+ *  Also tells us whether the server supports exact uploads at all. */
+async function resolveExactStatus(): Promise<void> {
+  if (!cfg || !exactDraft) return;
+  try {
+    const s = await getExactSoundcloudStatus(cfg, { url: exactDraft.url });
+    exactSupport = { supported: true, enabled: s.enabled, reason: s.reason };
+    exactTrackId = s.trackId;
+    renderExactState(s.state, s.failureReason);
+    if (!s.enabled) disableExact(exactDisabledMessage(s.reason));
+  } catch (e) {
+    if (e instanceof UnsupportedServerError) {
+      exactSupport = { supported: false };
+      disableExact(e.message);
+    }
+    // Any other failure: the Add path re-checks and reports it.
+  }
+}
+
+async function loadExactPlaylists(): Promise<void> {
+  if (!cfg || exactPlaylistsLoaded) return;
+  exactPlaylistsLoaded = true;
+  const sel = $('np-exact-playlist') as HTMLSelectElement;
+  try {
+    const playlists = await getExactSoundcloudPlaylists(cfg);
+    sel.length = 1;
+    for (const p of playlists) {
+      const opt = document.createElement('option');
+      opt.value = String(p.id);
+      opt.textContent = `${p.name} (${p.trackCount})`;
+      sel.appendChild(opt);
+    }
+  } catch {
+    exactPlaylistsLoaded = false; // retried on the next expand
+    sel.length = 1;
+    const opt = document.createElement('option');
+    opt.disabled = true;
+    opt.textContent = EXACT_PLAYLISTS_FAILED;
+    sel.appendChild(opt);
+  }
+}
+
+async function toggleExactForm(): Promise<void> {
+  const form = $('np-exact-form');
+  if (!form.hidden) {
+    form.hidden = true;
+    return;
+  }
+  if (!cfg || !exactDraft) return;
+  if (!exactSupport) {
+    try {
+      exactSupport = await soundcloudExactSupport(cfg);
+    } catch (e) {
+      throw connectionHint(cfg, e);
+    }
+  }
+  if (!exactSupport.supported) {
+    disableExact(UNSUPPORTED_SERVER_MESSAGE);
+    return;
+  }
+  if (!exactSupport.enabled) {
+    disableExact(exactDisabledMessage(exactSupport.reason));
+    return;
+  }
+  form.hidden = false;
+  ($('np-exact-title') as HTMLInputElement).focus();
+  void loadExactPlaylists();
+}
+
+function exactPlaylistNote(p: ExactAddResult['playlist']): string {
+  if (!p) return '';
+  const name = p.name ? `"${p.name}"` : 'the playlist';
+  if (p.error) return ` Couldn't add it to ${name}: ${p.error}`;
+  if (p.alreadyPresent) return ` Already in ${name}.`;
+  return p.added ? ` Added to ${name}.` : '';
+}
+
+async function addExactCurrent(): Promise<void> {
+  if (!cfg || !exactDraft) return;
+  const draft = exactDraft;
+  const btn = $('np-exact-add') as HTMLButtonElement;
+  btn.disabled = true;
+  btn.textContent = 'Adding…';
+  try {
+    const playlist = ($('np-exact-playlist') as HTMLSelectElement).value;
+    const req = buildExactRequest(
+      draft,
+      {
+        title: ($('np-exact-title') as HTMLInputElement).value,
+        artists: ($('np-exact-artists') as HTMLInputElement).value,
+        remixers: ($('np-exact-remixers') as HTMLInputElement).value,
+      },
+      playlist ? Number(playlist) : null,
+    );
+    let r: ExactAddResult;
+    try {
+      r = await addExactSoundcloudTrack(cfg, req);
+    } catch (e) {
+      if (e instanceof UnsupportedServerError) {
+        exactSupport = { supported: false };
+        disableExact(e.message); // the hint says it — no status line too
+        return;
+      }
+      throw e;
+    }
+    exactTrackId = r.trackId || exactTrackId;
+    $('np-exact-form').hidden = true;
+    renderExactState(r.state);
+    if (r.state === 'acquired') {
+      setStatus(`Already in your library (this exact upload).${exactPlaylistNote(r.playlist)}`);
+      return;
+    }
+    if (r.trackId) await rememberWishlisted(r.trackId);
+    const title = req.title ?? r.upload?.title ?? draft.title;
+    await pushHistory({
+      kind: 'wishlist',
+      title,
+      artist: req.artists?.join(', ') ?? (draft.uploader || r.upload?.uploader || ''),
+      artwork: draft.artwork || r.upload?.artworkUrl || '',
+      detail: r.created ? 'Exact SoundCloud upload queued' : 'Exact upload already on wishlist — updated',
+      at: Date.now(),
+    });
+    setStatus(
+      (r.created
+        ? `Queued the exact upload "${title}".`
+        : `The exact upload "${title}" was already on your wishlist — entry updated.`) +
+        exactPlaylistNote(r.playlist),
+      !!r.playlist?.error,
+    );
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Add';
+  }
+}
+
+async function removeExactCurrent(): Promise<void> {
+  if (!cfg || !exactTrackId) return;
+  const id = exactTrackId;
+  await removeFromWishlist(cfg, id);
+  await forgetWishlisted(id);
+  renderExactState('none');
+  await pushHistory({
+    kind: 'unwishlist',
+    title: exactDraft?.title ?? '',
+    artist: exactDraft?.uploader ?? '',
+    artwork: exactDraft?.artwork ?? '',
+    detail: 'Exact upload removed from wishlist',
+    at: Date.now(),
+  });
+  setStatus('Removed the exact upload from your wishlist.');
 }
 
 /* ── release pages ── */
@@ -1732,6 +1982,9 @@ function init(): void {
   $('np-help-match').addEventListener('click', () => toggleMatchPanel());
   $('np-wrong-match').addEventListener('click', () => toggleMatchPanel(true));
   $('np-match-search').addEventListener('click', () => void guard(runMatchSearch));
+  $('np-exact-toggle').addEventListener('click', () => void guard(toggleExactForm));
+  $('np-exact-add').addEventListener('click', () => void guard(addExactCurrent));
+  $('np-exact-remove').addEventListener('click', () => void guard(removeExactCurrent));
   $('np-match-q').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
       e.preventDefault();
@@ -1863,7 +2116,7 @@ document.addEventListener('DOMContentLoaded', () => {
     void loadServerExtras();
     await guard(async () => {
       await loadNowPlaying();
-      await resolveNpServerState();
+      await Promise.all([resolveNpServerState(), resolveExactStatus()]);
       await Promise.all([loadRelease(), loadPendingSelection()]);
     });
     // The player remote reattaches to the background host's state and keeps

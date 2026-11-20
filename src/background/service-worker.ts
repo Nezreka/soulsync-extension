@@ -7,11 +7,14 @@ import type { ServerConfig } from '../shared/types.js';
 import { deezerAlbumTracks } from '../shared/provider_ids.js';
 import type { ReleaseSource } from '../shared/types.js';
 import {
+  addExactSoundcloudTrack,
   addToWishlist,
   checkWatchlist,
   deezerPlaylistTrackToMirror,
   getConfig,
   getDeezerPlaylistTracks,
+  getExactSoundcloudPlaylists,
+  getExactSoundcloudStatus,
   getSpotifyPlaylistTracks,
   lookupBadgeStatuses,
   searchVideo,
@@ -38,10 +41,12 @@ import {
   searchArtists,
   serverOrigin,
   spotifyPlaylistTrackToMirror,
+  UnsupportedServerError,
   unwatchArtist,
   watchArtist,
   wishlistRelease,
 } from '../shared/api.js';
+import { buildExactRequest } from '../shared/soundcloud.js';
 import type { ArtistHit, DeezerPlaylistTrack, SpotifyPlaylistTrack } from '../shared/api.js';
 
 const MENU_ID = 'soulsync-send-selection';
@@ -123,6 +128,17 @@ export type BadgeAction =
       action: 'check-saved-playlist';
       source: 'spotify' | 'deezer';
       playlistId: string;
+    }
+  | { type: 'SOULSYNC_BADGE_ACTION'; action: 'sc-exact-status'; url: string; scId?: string }
+  | { type: 'SOULSYNC_BADGE_ACTION'; action: 'sc-exact-playlists' }
+  | {
+      type: 'SOULSYNC_BADGE_ACTION';
+      action: 'sc-exact-add';
+      url: string;
+      title: string;
+      artists: string[];
+      remixers?: string[];
+      playlistId?: number;
     };
 
 export type VideoBadgeAction =
@@ -269,10 +285,57 @@ function resolveArtistHit(cfg: ServerConfig, name: string): Promise<ArtistHit | 
   return p;
 }
 
+/**
+ * Whether each server (keyed by cfg.url) has the exact-SoundCloud routes,
+ * remembered for this worker's lifetime: an older server answers every call
+ * with 404/405, so once it has, badge checks stop asking.
+ */
+const exactSupportByServer = new Map<string, boolean>();
+
+/** Run an exact-upload call; an older server becomes {unsupported: true}. */
+async function exactCall(
+  cfg: ServerConfig,
+  fn: () => Promise<Record<string, unknown>>,
+): Promise<Record<string, unknown>> {
+  if (exactSupportByServer.get(cfg.url) === false) return { unsupported: true };
+  try {
+    const out = await fn();
+    exactSupportByServer.set(cfg.url, true);
+    return out;
+  } catch (e) {
+    if (e instanceof UnsupportedServerError) {
+      exactSupportByServer.set(cfg.url, false);
+      return { unsupported: true };
+    }
+    throw e;
+  }
+}
+
 async function handleBadgeAction(m: BadgeAction): Promise<Record<string, unknown>> {
   const cfg = await getConfig();
   if (!cfg) return { error: 'No server configured — open the extension options first.' };
   try {
+    if (m.action === 'sc-exact-status') {
+      // awaited so a failure lands in the catch below as {error}
+      return await throttledBadgeCheck(() =>
+        exactCall(cfg, async () => {
+          const s = await getExactSoundcloudStatus(cfg, { url: m.url, scId: m.scId });
+          return { ...s, serverUrl: serverOrigin(cfg) };
+        }),
+      );
+    }
+    if (m.action === 'sc-exact-playlists') {
+      return exactCall(cfg, async () => ({ playlists: await getExactSoundcloudPlaylists(cfg) }));
+    }
+    if (m.action === 'sc-exact-add') {
+      return exactCall(cfg, async () => {
+        const r = await addExactSoundcloudTrack(
+          cfg,
+          buildExactRequest({ url: m.url }, { title: m.title, artists: m.artists, remixers: m.remixers }, m.playlistId),
+        );
+        return { ok: true, created: r.created, state: r.state, trackId: r.trackId, playlist: r.playlist };
+      });
+    }
     if (m.action === 'resolve-artist') {
       return throttledBadgeCheck(async () => {
         const best = await resolveArtistHit(cfg, m.name);
