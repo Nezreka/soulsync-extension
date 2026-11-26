@@ -18,5 +18,5 @@
     "package": "npm run build && node scripts/package.mjs"
   },
   "type": "module",
-  "version": "0.2.0"
+  "version": "0.3.0"
 }

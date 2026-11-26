@@ -7,11 +7,18 @@ import type { ServerConfig } from '../shared/types.js';
 import { deezerAlbumTracks } from '../shared/provider_ids.js';
 import type { ReleaseSource } from '../shared/types.js';
 import {
+  addExactSoundcloudTrack,
   addToWishlist,
+  checkVideo,
   checkWatchlist,
+  forgetArtistCheck,
+  rememberedWatchId,
+  watchStateFromCheck,
   deezerPlaylistTrackToMirror,
   getConfig,
   getDeezerPlaylistTracks,
+  getExactSoundcloudPlaylists,
+  getExactSoundcloudStatus,
   getSpotifyPlaylistTracks,
   lookupBadgeStatuses,
   searchVideo,
@@ -38,10 +45,12 @@ import {
   searchArtists,
   serverOrigin,
   spotifyPlaylistTrackToMirror,
+  UnsupportedServerError,
   unwatchArtist,
   watchArtist,
   wishlistRelease,
 } from '../shared/api.js';
+import { buildExactRequest } from '../shared/soundcloud.js';
 import type { ArtistHit, DeezerPlaylistTrack, SpotifyPlaylistTrack } from '../shared/api.js';
 
 const MENU_ID = 'soulsync-send-selection';
@@ -123,6 +132,17 @@ export type BadgeAction =
       action: 'check-saved-playlist';
       source: 'spotify' | 'deezer';
       playlistId: string;
+    }
+  | { type: 'SOULSYNC_BADGE_ACTION'; action: 'sc-exact-status'; url: string; scId?: string }
+  | { type: 'SOULSYNC_BADGE_ACTION'; action: 'sc-exact-playlists' }
+  | {
+      type: 'SOULSYNC_BADGE_ACTION';
+      action: 'sc-exact-add';
+      url: string;
+      title: string;
+      artists: string[];
+      remixers?: string[];
+      playlistId?: number;
     };
 
 export type VideoBadgeAction =
@@ -237,20 +257,89 @@ const throttledVideoCheck = throttledBadgeCheck;
  */
 const ARTIST_RESOLVE_TTL_MS = 10 * 60_000;
 const artistResolveCache = new Map<string, { at: number; p: Promise<ArtistHit | null> }>();
+const ARTIST_RESOLVE_NULL_TTL_MS = 90_000;
 function resolveArtistHit(cfg: ServerConfig, name: string): Promise<ArtistHit | null> {
-  const key = normName(name);
+  // Keyed by server as well as name: the same artist name resolved against
+  // a different server is a different answer.
+  const key = `${cfg.url}|${normName(name)}`;
   const hit = artistResolveCache.get(key);
   if (hit && Date.now() - hit.at < ARTIST_RESOLVE_TTL_MS) return hit.p;
   const p = searchArtists(cfg, name, 5).then((hits) => pickBestArtist(hits, name));
   artistResolveCache.set(key, { at: Date.now(), p });
-  p.catch(() => artistResolveCache.delete(key));
+  p.then(
+    (v) => {
+      // A no-match is remembered only briefly: the full TTL would poison
+      // watch checks for 10 minutes when the metadata source catches up,
+      // but no memory at all makes every SPA re-scan of an unresolvable
+      // artist (recycled rows remount and re-ask) cost a fresh external
+      // search. Shorten this entry's remaining life instead of deleting.
+      if (v === null && artistResolveCache.get(key)?.p === p) {
+        artistResolveCache.set(key, {
+          at: Date.now() - (ARTIST_RESOLVE_TTL_MS - ARTIST_RESOLVE_NULL_TTL_MS),
+          p,
+        });
+      }
+    },
+    () => {
+      // Failures aren't remembered (only delete our own entry — a newer
+      // resolve for the same key may already have replaced it).
+      if (artistResolveCache.get(key)?.p === p) artistResolveCache.delete(key);
+    },
+  );
   return p;
+}
+
+/**
+ * Whether each server (keyed by cfg.url) has the exact-SoundCloud routes,
+ * remembered for this worker's lifetime: an older server answers every call
+ * with 404/405, so once it has, badge checks stop asking.
+ */
+const exactSupportByServer = new Map<string, boolean>();
+
+/** Run an exact-upload call; an older server becomes {unsupported: true}. */
+async function exactCall(
+  cfg: ServerConfig,
+  fn: () => Promise<Record<string, unknown>>,
+): Promise<Record<string, unknown>> {
+  if (exactSupportByServer.get(cfg.url) === false) return { unsupported: true };
+  try {
+    const out = await fn();
+    exactSupportByServer.set(cfg.url, true);
+    return out;
+  } catch (e) {
+    if (e instanceof UnsupportedServerError) {
+      exactSupportByServer.set(cfg.url, false);
+      return { unsupported: true };
+    }
+    throw e;
+  }
 }
 
 async function handleBadgeAction(m: BadgeAction): Promise<Record<string, unknown>> {
   const cfg = await getConfig();
   if (!cfg) return { error: 'No server configured — open the extension options first.' };
   try {
+    if (m.action === 'sc-exact-status') {
+      // awaited so a failure lands in the catch below as {error}
+      return await throttledBadgeCheck(() =>
+        exactCall(cfg, async () => {
+          const s = await getExactSoundcloudStatus(cfg, { url: m.url, scId: m.scId });
+          return { ...s, serverUrl: serverOrigin(cfg) };
+        }),
+      );
+    }
+    if (m.action === 'sc-exact-playlists') {
+      return exactCall(cfg, async () => ({ playlists: await getExactSoundcloudPlaylists(cfg) }));
+    }
+    if (m.action === 'sc-exact-add') {
+      return exactCall(cfg, async () => {
+        const r = await addExactSoundcloudTrack(
+          cfg,
+          buildExactRequest({ url: m.url }, { title: m.title, artists: m.artists, remixers: m.remixers }, m.playlistId),
+        );
+        return { ok: true, created: r.created, state: r.state, trackId: r.trackId, playlist: r.playlist };
+      });
+    }
     if (m.action === 'resolve-artist') {
       return throttledBadgeCheck(async () => {
         const best = await resolveArtistHit(cfg, m.name);
@@ -266,10 +355,21 @@ async function handleBadgeAction(m: BadgeAction): Promise<Record<string, unknown
     }
     if (m.action === 'watch-artist') {
       await watchArtist(cfg, m.id, m.name, m.source);
+      forgetArtistCheck(cfg, m.name);
       return { ok: true };
     }
     if (m.action === 'unwatch-artist') {
-      await unwatchArtist(cfg, m.id);
+      // the batch check names the watchlist row it matched (it may be stored
+      // under another provider's id than the one the search resolves to):
+      // remove that row, and the resolved id too
+      const rowId = await rememberedWatchId(cfg, m.name);
+      if (rowId && rowId !== m.id) {
+        await unwatchArtist(cfg, rowId);
+        await unwatchArtist(cfg, m.id).catch(() => undefined);
+      } else {
+        await unwatchArtist(cfg, m.id);
+      }
+      forgetArtistCheck(cfg, m.name);
       return { ok: true };
     }
     if (m.action === 'check-watchlist') {
@@ -357,12 +457,15 @@ async function resolveVideoHit(
   kind: 'movie' | 'show',
   tmdbId?: number,
 ): Promise<VideoSearchHit | null> {
-  // TMDB id from the URL is exact — still resolve through search for the
-  // canonical title/year/poster the wishlist API wants.
-  const hits = await searchVideo(cfg, tmdbId ? String(tmdbId) : title);
+  // TMDB id from the URL is exact. The title search finds the canonical
+  // title/year/poster the wishlist API wants; when it doesn't list the id,
+  // the page's own title stands in (the id is what identifies it). The old
+  // search for the bare id ("603") never found the title it named.
+  const hits = await searchVideo(cfg, title);
   if (tmdbId) {
     const exact = hits.find((h) => h.tmdbId === tmdbId);
     if (exact) return exact;
+    return { tmdbId, title, kind, year, posterUrl: '' };
   }
   // Best text match: prefer same kind, then year proximity. Don't hard-filter
   // by kind — IMDb cards guess the kind and a wrong guess must not nuke results.
@@ -380,16 +483,52 @@ async function resolveVideoHit(
   return scored.length > 0 && scored[0].score > 0 ? scored[0].h : null;
 }
 
+/**
+ * A card's pill state from the batched video check, or null when the server
+ * has no batch route (the caller takes the per-title calls). Same states as
+ * the per-title path; an episode is on the wishlist only when that episode is.
+ */
+async function videoStateFromCheck(
+  cfg: ServerConfig,
+  kind: 'movie' | 'show',
+  tmdbId: number,
+  episode?: { season: number; episode: number },
+): Promise<Record<string, unknown> | null> {
+  const v = await checkVideo(cfg, { kind, tmdbId, episode });
+  if (v === 'unsupported') return null;
+  // For episodes, report 'movie' kind so the overlay renders the wishlist
+  // badge (not the watchlist eye).
+  const hitKind = episode ? 'movie' : kind;
+  if (v === null) return { state: 'unknown', onWatchlist: null, hitKind };
+  if (episode) {
+    const base = { onWatchlist: null, hitKind };
+    if (v.episodeInLibrary === true) return { state: 'in-library', ...base };
+    if (v.episodeInLibrary === null) return { state: 'unknown', ...base };
+    return { state: v.episodeOnWishlist === true ? 'on-wishlist' : 'addable', ...base };
+  }
+  const base = { onWatchlist: kind === 'show' ? v.following : null, hitKind };
+  if (v.inLibrary) return { state: 'in-library', ...base };
+  if (v.onWishlist) return { state: 'on-wishlist', ...base };
+  return { state: 'addable', ...base };
+}
+
 async function handleVideoBadgeAction(m: VideoBadgeAction): Promise<Record<string, unknown>> {
   const cfg = await getConfig();
   if (!cfg) return { error: 'No server configured — open the extension options first.' };
   try {
     if (m.action === 'check-video') {
+      // Episodes resolve as their show, then check the specific episode.
+      const kind = m.episode ? 'show' : m.kind;
+      // newer servers, TMDB id on the page: one batched check, no search
+      if (m.tmdbId && m.tmdbId > 0) {
+        const fast = await videoStateFromCheck(cfg, kind, m.tmdbId, m.episode);
+        if (fast) return fast;
+      }
       return throttledVideoCheck(async () => {
-        // Episodes resolve as their show, then check the specific episode.
-        const kind = m.episode ? 'show' : m.kind;
         const hit = await resolveVideoHit(cfg, m.title, m.year, kind, m.tmdbId);
         if (!hit) return { state: 'unknown', onWatchlist: null, hitKind: null };
+        const viaBatch = await videoStateFromCheck(cfg, hit.kind, hit.tmdbId, m.episode);
+        if (viaBatch) return viaBatch;
         // For episodes, report 'movie' kind so the overlay renders the wishlist
         // badge (not the watchlist eye).
         const hitKind = m.episode ? 'movie' : hit.kind;
@@ -532,6 +671,9 @@ browser.runtime.onMessage.addListener((message: unknown) => {
       const entries = await Promise.all(
         items.map(async (it) => {
           try {
+            // newer servers: one batched check, no metadata search per artist
+            const batched = await watchStateFromCheck(cfg, it.name, it.providerId);
+            if (batched !== undefined) return { watching: batched };
             let id = it.providerId ?? '';
             if (!id && it.name) {
               const best = await resolveArtistHit(cfg, it.name);

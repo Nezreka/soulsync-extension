@@ -142,6 +142,79 @@ requirement.
 
 ---
 
+## Endpoint 3 — Exact SoundCloud uploads: `/api/v1/soundcloud/exact`
+
+> Newer servers only (SoulSync with the exact-upload routes). The extension
+> detects support per call and degrades cleanly on older servers.
+
+Wishlists ONE specific SoundCloud upload. The server resolves the link,
+keys the wishlist row `soundcloud_exact_<numeric SoundCloud track id>`, and
+its download worker fetches only that upload — it never searches the
+catalogue and never falls back to a different recording. Any form of the
+link (public permalink, `/s-<token>` private share link, `m.`/`www.` hosts,
+`on.soundcloud.com` short link) lands on the same row. All three routes use
+the v1 auth, take the profile from `X-Profile-Id`/`?profile_id` (default 1),
+and answer with the standard envelope.
+
+### `GET /api/v1/soundcloud/exact` — capability probe + status
+
+Query (optional): `sc_id=<digits>` or `url=<soundcloud url>`; no network
+call on the server. 200:
+
+```json
+{"supported": true, "enabled": true, "reason": null,
+ "state": "none|queued|failed|downloading|acquired", "matched": true,
+ "track_id": "soundcloud_exact_123", "failure_reason": null,
+ "retry_count": 0, "last_attempted": null}
+```
+
+`enabled: false` comes with `reason` `"source_disabled"` (SoundCloud is not
+an enabled download source) or `"source_unavailable"` (yt-dlp missing).
+`failed` = the row is still on the wishlist with `retry_count > 0` (retried
+under backoff); the popup offers Remove (`DELETE /api/v1/wishlist/<track_id>`).
+
+### `GET /api/v1/soundcloud/exact/playlists`
+
+`{"playlists": [{"id": 12, "name": "Flips", "track_count": 40, "liked": false}]}`
+— the profile's own SoulSync playlists, the only ones an exact upload can
+join (upstream mirrors are rewritten on refresh).
+
+### `POST /api/v1/soundcloud/exact`
+
+```json
+{"url": "https://soundcloud.com/u/t", "title": "Tag title", "artists": ["A"],
+ "remixers": ["R"], "playlist_id": 12, "quality_profile_id": 3}
+```
+
+Only `url` is required; empty fields are omitted so the server's defaults
+apply (title split from the upload title, artist = split artist else the
+uploader). Remixers become extra artist credits. 201 (new row) / 200
+(existing row refreshed, or `state: "acquired"`):
+`{created, state, track_id, upload: {sc_id, permalink_url, title, uploader,
+duration_ms, artwork_url, official_download}, track, playlist: {id, name,
+added, already_present} | {id, added: false, error} | null}`.
+
+Errors (no wishlist row is written; one exception: a user-initiated add
+clears a stale wishlist-ignore entry before a quota or permission refusal
+can land — the shared wishlist add's behaviour for every user add):
+400 `BAD_REQUEST`, 400 `NOT_SOUNDCLOUD_TRACK`,
+400 `BAD_PLAYLIST`, 422 `PLAYLIST_NOT_EDITABLE`, 422 `UPLOAD_UNAVAILABLE`,
+409 `SOURCE_DISABLED`, 503 `SOURCE_UNAVAILABLE`, 409 `BLOCKLISTED`,
+400 `REJECTED`, 500 `WISHLIST_ERROR`. `shared/soundcloud.ts::exactErrorMessage`
+maps each code to user text.
+
+### Unsupported-server rule
+
+These routes never answer 404 or 405. An older server sends the unknown path
+to the SPA catch-all, which answers **GET → 404, POST → 405** with no v1
+envelope. So: **404 or 405 = "server doesn't support exact uploads"**, whatever
+the body (`UnsupportedServerError`; the background caches it per server for
+the worker's lifetime); anything else is a normal error. The user sees:
+"Your SoulSync server doesn't support adding exact SoundCloud uploads yet.
+Update SoulSync to use this."
+
+---
+
 ## What the extension sends where (wiring map)
 
 | Popup action              | Server call                                              |
@@ -151,6 +224,8 @@ requirement.
 | Text import → Playlist    | `POST /api/v1/playlists/companion-<uuid>/sync`           |
 | Release page → Send       | `POST /api/v1/wishlist` per track (bulk; feeds the same pipeline) |
 | Settings → Test           | `GET /api/v1/playlists` (cheap authenticated GET)        |
+| Now playing → Add exact SoundCloud upload | `GET /api/v1/soundcloud/exact?url=` (status/probe), `GET /api/v1/soundcloud/exact/playlists`, `POST /api/v1/soundcloud/exact` — no catalogue search |
+| SoundCloud track page pill | same three routes, through the background `sc-exact-*` badge actions |
 
 > There is no Download action. The extension used to call `POST /api/v1/request`
 > for one, but it was cut Sep 28, 2026: live testing showed the endpoint
@@ -170,17 +245,34 @@ requirement.
   `<hash>::soulsync`. The client keeps them as strings (`LibraryId` in
   `shared/player-api.ts`) and never parses them. Video and mirrored-playlist
   ids are still integers.
-- **v1 is rate-limited to 60 requests/minute per IP** (`api/__init__.py`,
-  flask-limiter fixed window, no `Retry-After`). `shared/http.ts` paces v1
-  calls to 45/minute per extension context and retries a 429 after a backoff;
-  every server request also has a timeout.
+- **v1 rate limit:** a request with a valid API key gets its own bucket of
+  600/minute (SoulSync 3.6.2+, #1923); older servers allow 60/minute per IP
+  (`api/__init__.py`, flask-limiter fixed window, no `Retry-After`).
+  `shared/http.ts` paces v1 calls to 250/minute per extension context; the
+  first 429 means an older server and drops the pacer to 45/minute. A 429 is
+  retried after a backoff; every server request also has a timeout.
+- **Batched badge checks (newer servers):** `POST /api/v1/library/check`
+  `{artists: [{name, provider_id?, albums?}]}` answers a page of artist names
+  in one request: `in_library`, `artist_id`, `albums` when asked, and
+  `watching`/`watch_id` (by the page's id, the library artist's ids, or the
+  watched name: no metadata search). `POST /api/v1/video/check`
+  `{items: [{kind, tmdb_id, season?, episode?}]}` does the same for movies
+  and shows by TMDB id (`in_library`, `on_wishlist`, `following`,
+  `episode_in_library`, `episode_on_wishlist`). The background coalesces
+  every check made within 40 ms into one request. 404/405 (or a 2xx without
+  an envelope) = an older server: remembered per server, and the per-artist
+  calls below take over.
 - **Track badges batch through `POST /api/library/check-tracks`**
   `{artist_name, tracks: [{name}]}` → `{success, owned_tracks: {name: {owned,
   track_id, file_path, …}}}`: the web UI's own ownership matcher, one request
   per artist, non-v1 so not rate-limited. A missing route (older server) falls
   back to search → `GET /api/v1/library/lookup` → `GET /api/v1/library/tracks`.
-- **Album badges use `GET /api/v1/library/artists/<id>/albums`**, once per
-  artist, matched locally.
+- **Album badges** match locally among the artist's albums (from the batch
+  check, or `GET /api/v1/library/artists/<id>/albums` once per artist on an
+  older server): the exact title first, then the same album on another
+  edition ("Abbey Road (Remastered)" = "Abbey Road").
+- **Track badges for a multi-artist credit** ask check-tracks for the credit
+  as written and for each artist on its own; any "owned" answers.
 - **Read-only API keys** (`scope: "read"`) pass every GET under `/api/v1/` but
   get `403 INSUFFICIENT_SCOPE` on every POST and every non-v1 route
   (`api/auth.py::enforce_read_key_scope`). Test connection probes

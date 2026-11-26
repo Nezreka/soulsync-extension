@@ -1,17 +1,32 @@
 import browser from 'webextension-polyfill';
-import type { NowPlaying, ParsedTrack, ReleaseInfo, ServerConfig } from '../shared/types.js';
+import type { ExactUploadDraft, NowPlaying, ParsedTrack, ReleaseInfo, ServerConfig } from '../shared/types.js';
 import { cleanNowPlaying } from '../shared/types.js';
 import { parseSelection } from '../shared/parse.js';
 import {
+  buildExactRequest,
+  exactDisabledMessage,
+  exactDraftFor,
+  exactStateLabel,
+  splitScTitle,
+  EXACT_PLAYLISTS_FAILED,
+  UNSUPPORTED_SERVER_MESSAGE,
+} from '../shared/soundcloud.js';
+import {
+  addExactSoundcloudTrack,
   addToWishlist,
   BADGES_ENABLED_KEY,
   badgesEnabledFromStored,
+  connectionHint,
   describeReleaseResult,
   directArtwork,
   getConfig,
+  getExactSoundcloudPlaylists,
+  getExactSoundcloudStatus,
   getRecentlyAdded,
   getRecentlyAddedVideos,
   getVideoStats,
+  isServerCardSnapshot,
+  mergeServerCardSnapshot,
   getServerStats,
   getWishlistCount,
   importToPlaylist,
@@ -20,11 +35,17 @@ import {
   removeFromWishlist,
   searchTracks,
   serverArtwork,
+  soundcloudExactSupport,
+  UnsupportedServerError,
   wishlistRelease,
   wishlistTrack,
+  type ExactAddResult,
+  type ExactSupport,
   type RecentAlbum,
   type RecentVideo,
   type VideoStats,
+  type ServerCardFresh,
+  type ServerCardSnapshot,
   type ServerStats,
   type TrackHit,
 } from '../shared/api.js';
@@ -237,6 +258,9 @@ async function loadNowPlaying(): Promise<void> {
   const tab = await activeTab();
   const res = await askTab<{ nowPlaying: NowPlaying | null }>(tab?.id, 'SOULSYNC_GET_NOW_PLAYING');
   currentNp = res?.nowPlaying ? cleanNowPlaying(res.nowPlaying) : null;
+  // The exact-upload form works from the RAW media-session fields: on
+  // SoundCloud the "artist" is the uploader and the title is the upload's own.
+  prepareExact(res?.nowPlaying ?? null, tab?.url);
   $('np-empty').hidden = currentNp !== null;
   $('np-card').hidden = currentNp === null;
   if (!currentNp) return;
@@ -469,6 +493,237 @@ async function unwishlistCurrent(): Promise<void> {
   setStatus(`Removed "${hit.title}" from your wishlist.`);
 }
 
+/* ── exact SoundCloud upload ──
+ * A separate action from the catalogue Wishlist button above: it wishlists
+ * THIS upload (the server resolves the link and downloads only that upload)
+ * and never searches the catalogue. */
+
+let exactDraft: ExactUploadDraft | null = null;
+/** null until the server answered the probe (or a status check). */
+let exactSupport: ExactSupport | null = null;
+/** wishlist id of the exact row, once the server named it */
+let exactTrackId: string | null = null;
+let exactPlaylistsLoaded = false;
+
+function isSoundcloudHost(url: string | undefined): boolean {
+  try {
+    return !!url && /(^|\.)soundcloud\.com$/i.test(new URL(url).hostname);
+  } catch {
+    return false;
+  }
+}
+
+function showExactHint(msg: string): void {
+  const hint = $('np-exact-hint');
+  hint.textContent = msg;
+  hint.hidden = !msg;
+}
+
+/** The action can't run (old server, SoundCloud off): say why, lock it. */
+function disableExact(msg: string): void {
+  ($('np-exact-toggle') as HTMLButtonElement).disabled = true;
+  $('np-exact-form').hidden = true;
+  showExactHint(msg);
+}
+
+function renderExactState(state: string, failureReason: string | null = null): void {
+  const label = exactStateLabel(state, failureReason);
+  const tags = $('np-exact-tags');
+  tags.innerHTML = '';
+  if (label.tag) tags.appendChild(makeTag(label.tag, label.cls));
+  $('np-exact-state').textContent = label.line;
+  $('np-exact-remove').hidden = !(state === 'failed' && exactTrackId);
+  $('np-exact-staterow').hidden = !label.line;
+}
+
+function prepareExact(np: NowPlaying | null, tabUrl: string | undefined): void {
+  exactDraft = exactDraftFor(np, tabUrl);
+  exactSupport = null;
+  exactTrackId = null;
+  exactPlaylistsLoaded = false;
+  const onSoundcloud = isSoundcloudHost(tabUrl) || !!np?.sourceUrl;
+  $('np-exact').hidden = !np || (!exactDraft && !onSoundcloud);
+  $('np-exact-form').hidden = true;
+  renderExactState('none');
+  const toggle = $('np-exact-toggle') as HTMLButtonElement;
+  if (!exactDraft) {
+    toggle.hidden = true;
+    showExactHint("Open the track's page to add the exact upload.");
+    return;
+  }
+  toggle.hidden = false;
+  toggle.disabled = false;
+  showExactHint('');
+  // A draft from the tab URL has no tags (the playing track's belong to
+  // another upload): the fields start empty and the server uses the
+  // upload's own title and uploader.
+  const tagged = !!(exactDraft.title || exactDraft.uploader);
+  const split = splitScTitle(exactDraft.title, exactDraft.uploader);
+  const titleIn = $('np-exact-title') as HTMLInputElement;
+  const artistsIn = $('np-exact-artists') as HTMLInputElement;
+  titleIn.value = split.title;
+  titleIn.placeholder = tagged ? '' : "Leave empty to use the upload's own title";
+  artistsIn.value = split.artist;
+  artistsIn.placeholder = tagged ? 'Comma-separated' : 'Comma-separated — empty uses the uploader';
+  ($('np-exact-remixers') as HTMLInputElement).value = '';
+  const link = exactDraft.url.replace(/^https:\/\//, '');
+  $('np-exact-uploader').textContent = tagged ? `Uploaded by ${exactDraft.uploader || 'unknown'} · ${link}` : link;
+  const sel = $('np-exact-playlist') as HTMLSelectElement;
+  sel.length = 1;
+}
+
+/** Status of this exact upload on the server (no network server-side).
+ *  Also tells us whether the server supports exact uploads at all. */
+async function resolveExactStatus(): Promise<void> {
+  if (!cfg || !exactDraft) return;
+  try {
+    const s = await getExactSoundcloudStatus(cfg, { url: exactDraft.url });
+    exactSupport = { supported: true, enabled: s.enabled, reason: s.reason };
+    exactTrackId = s.trackId;
+    renderExactState(s.state, s.failureReason);
+    if (!s.enabled) disableExact(exactDisabledMessage(s.reason));
+  } catch (e) {
+    if (e instanceof UnsupportedServerError) {
+      exactSupport = { supported: false };
+      disableExact(e.message);
+    }
+    // Any other failure: the Add path re-checks and reports it.
+  }
+}
+
+async function loadExactPlaylists(): Promise<void> {
+  if (!cfg || exactPlaylistsLoaded) return;
+  exactPlaylistsLoaded = true;
+  const sel = $('np-exact-playlist') as HTMLSelectElement;
+  try {
+    const playlists = await getExactSoundcloudPlaylists(cfg);
+    sel.length = 1;
+    for (const p of playlists) {
+      const opt = document.createElement('option');
+      opt.value = String(p.id);
+      opt.textContent = `${p.name} (${p.trackCount})`;
+      sel.appendChild(opt);
+    }
+  } catch {
+    exactPlaylistsLoaded = false; // retried on the next expand
+    sel.length = 1;
+    const opt = document.createElement('option');
+    opt.disabled = true;
+    opt.textContent = EXACT_PLAYLISTS_FAILED;
+    sel.appendChild(opt);
+  }
+}
+
+async function toggleExactForm(): Promise<void> {
+  const form = $('np-exact-form');
+  if (!form.hidden) {
+    form.hidden = true;
+    return;
+  }
+  if (!cfg || !exactDraft) return;
+  if (!exactSupport) {
+    try {
+      exactSupport = await soundcloudExactSupport(cfg);
+    } catch (e) {
+      throw connectionHint(cfg, e);
+    }
+  }
+  if (!exactSupport.supported) {
+    disableExact(UNSUPPORTED_SERVER_MESSAGE);
+    return;
+  }
+  if (!exactSupport.enabled) {
+    disableExact(exactDisabledMessage(exactSupport.reason));
+    return;
+  }
+  form.hidden = false;
+  ($('np-exact-title') as HTMLInputElement).focus();
+  void loadExactPlaylists();
+}
+
+function exactPlaylistNote(p: ExactAddResult['playlist']): string {
+  if (!p) return '';
+  const name = p.name ? `"${p.name}"` : 'the playlist';
+  if (p.error) return ` Couldn't add it to ${name}: ${p.error}`;
+  if (p.alreadyPresent) return ` Already in ${name}.`;
+  return p.added ? ` Added to ${name}.` : '';
+}
+
+async function addExactCurrent(): Promise<void> {
+  if (!cfg || !exactDraft) return;
+  const draft = exactDraft;
+  const btn = $('np-exact-add') as HTMLButtonElement;
+  btn.disabled = true;
+  btn.textContent = 'Adding…';
+  try {
+    const playlist = ($('np-exact-playlist') as HTMLSelectElement).value;
+    const req = buildExactRequest(
+      draft,
+      {
+        title: ($('np-exact-title') as HTMLInputElement).value,
+        artists: ($('np-exact-artists') as HTMLInputElement).value,
+        remixers: ($('np-exact-remixers') as HTMLInputElement).value,
+      },
+      playlist ? Number(playlist) : null,
+    );
+    let r: ExactAddResult;
+    try {
+      r = await addExactSoundcloudTrack(cfg, req);
+    } catch (e) {
+      if (e instanceof UnsupportedServerError) {
+        exactSupport = { supported: false };
+        disableExact(e.message); // the hint says it — no status line too
+        return;
+      }
+      throw e;
+    }
+    exactTrackId = r.trackId || exactTrackId;
+    $('np-exact-form').hidden = true;
+    renderExactState(r.state);
+    if (r.state === 'acquired') {
+      setStatus(`Already in your library (this exact upload).${exactPlaylistNote(r.playlist)}`);
+      return;
+    }
+    if (r.trackId) await rememberWishlisted(r.trackId);
+    const title = req.title ?? r.upload?.title ?? draft.title;
+    await pushHistory({
+      kind: 'wishlist',
+      title,
+      artist: req.artists?.join(', ') ?? (draft.uploader || r.upload?.uploader || ''),
+      artwork: draft.artwork || r.upload?.artworkUrl || '',
+      detail: r.created ? 'Exact SoundCloud upload queued' : 'Exact upload already on wishlist — updated',
+      at: Date.now(),
+    });
+    setStatus(
+      (r.created
+        ? `Queued the exact upload "${title}".`
+        : `The exact upload "${title}" was already on your wishlist — entry updated.`) +
+        exactPlaylistNote(r.playlist),
+      !!r.playlist?.error,
+    );
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Add';
+  }
+}
+
+async function removeExactCurrent(): Promise<void> {
+  if (!cfg || !exactTrackId) return;
+  const id = exactTrackId;
+  await removeFromWishlist(cfg, id);
+  await forgetWishlisted(id);
+  renderExactState('none');
+  await pushHistory({
+    kind: 'unwishlist',
+    title: exactDraft?.title ?? '',
+    artist: exactDraft?.uploader ?? '',
+    artwork: exactDraft?.artwork ?? '',
+    detail: 'Exact upload removed from wishlist',
+    at: Date.now(),
+  });
+  setStatus('Removed the exact upload from your wishlist.');
+}
+
 /* ── release pages ── */
 
 function isReleasePage(url: string | undefined): boolean {
@@ -653,41 +908,146 @@ function renderVideoRail(cfg: ServerConfig, videos: RecentVideo[]): void {
 }
 
 /** Shimmer placeholders shown in the server card while it loads. */
+function renderRailSkeleton(el: HTMLElement): void {
+  el.innerHTML = '<div class="skel-rail"><div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div></div>';
+}
+
 function renderServerSkeleton(): void {
   const stats = $('server-stats');
   stats.innerHTML = '<div class="skel-stats"><div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div></div>';
-  const rail = $('recent-rail');
-  rail.innerHTML = '<div class="skel-rail"><div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div></div>';
-  const vrail = $('recent-video-rail');
-  vrail.innerHTML = '<div class="skel-rail"><div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div></div>';
+  renderRailSkeleton($('recent-rail'));
+  renderRailSkeleton($('recent-video-rail'));
+}
+
+/* ── server card snapshot: last good data, painted instantly ── */
+
+const SERVER_CARD_CACHE_KEY = 'soulsync_server_card';
+
+async function loadServerCardSnapshot(forUrl: string): Promise<ServerCardSnapshot | null> {
+  try {
+    const stored = (await browser.storage.local.get(SERVER_CARD_CACHE_KEY)) as Record<string, unknown>;
+    const snap: unknown = stored[SERVER_CARD_CACHE_KEY];
+    // Storage survives extension updates: a snapshot written by another
+    // version is shape-checked before anything paints from it, or a
+    // drifted shape would crash the paint on every open, forever.
+    if (isServerCardSnapshot(snap) && snap.url === forUrl) return snap;
+  } catch {
+    /* the snapshot is a nicety, never a failure */
+  }
+  return null;
+}
+
+async function saveServerCardSnapshot(snap: ServerCardSnapshot): Promise<void> {
+  try {
+    await browser.storage.local.set({ [SERVER_CARD_CACHE_KEY]: snap });
+  } catch {
+    /* same: a lost save only costs the next open its instant paint */
+  }
 }
 
 /**
- * Load the server card. The card appears immediately with a skeleton shimmer
- * and fills in when the data lands; on failure it hides again.
+ * Load the server card. The last good snapshot for this server paints
+ * instantly (a skeleton shimmer when there is none yet), then each section
+ * is replaced as its own data lands — the library stats count can take
+ * seconds on a big library, and it must not hold the rails hostage while
+ * it runs. Only the stats call decides whether the card shows at all; a
+ * failed refresh leaves the snapshot up rather than vanishing the card.
  */
 async function loadServerExtras(): Promise<void> {
   if (!cfg) return;
+  const myCfg = cfg;
   $('server-card').hidden = false;
-  renderServerSkeleton();
-  // Only the stats call decides whether the card shows. The rails and the
-  // counts degrade on their own: a music-only server (no video library) or
-  // one slow endpoint must not take the whole card down with it.
-  const [stats, albums, videos, wishlistCount, videoStats] = await Promise.allSettled([
-    getServerStats(cfg),
-    getRecentlyAdded(cfg, 12),
-    getRecentlyAddedVideos(cfg, 12),
-    getWishlistCount(cfg),
-    getVideoStats(cfg),
-  ]);
-  if (stats.status === 'rejected') {
-    $('server-card').hidden = true;
-    return;
+
+  const snap = await loadServerCardSnapshot(myCfg.url);
+  let painted = false;
+  if (snap) {
+    try {
+      renderStats(snap.stats, snap.wishlistCount, snap.videoStats);
+      // A rail that has never landed for this server stays a skeleton
+      // until its data arrives; painting it as empty would be a guess.
+      if (snap.albums) renderRail(myCfg, snap.albums);
+      else renderRailSkeleton($('recent-rail'));
+      if (snap.videos) renderVideoRail(myCfg, snap.videos);
+      else renderRailSkeleton($('recent-video-rail'));
+      // Say it's saved data from the start, not only once the refresh has
+      // failed: the refresh can take a while, and the download pill in
+      // particular reads as live status.
+      $('server-last-update').textContent =
+        `saved data from ${relativeTime(snap.statsSavedAt)} · refreshing…`;
+      painted = true;
+    } catch {
+      painted = false;
+    }
   }
-  const ok = <T,>(r: PromiseSettledResult<T>, fallback: T): T => (r.status === 'fulfilled' ? r.value : fallback);
-  renderStats(stats.value, ok(wishlistCount, 0), ok(videoStats, null));
-  renderRail(cfg, ok(albums, [] as RecentAlbum[]));
-  renderVideoRail(cfg, ok(videos, [] as RecentVideo[]));
+  if (!painted) renderServerSkeleton();
+
+  // Only sections whose calls actually landed enter `fresh`; a fallback
+  // rendered for a failed call (a 0, an empty rail) is never persisted as
+  // if it were last good data. Each section persists the merge as soon as
+  // it lands (serialized through one chain), so closing the popup during
+  // a slow stats call doesn't throw away rails that already arrived.
+  const fresh: ServerCardFresh = {};
+  let persistChain: Promise<void> = Promise.resolve();
+  const persist = (): Promise<void> => {
+    persistChain = persistChain.then(async () => {
+      const merged = mergeServerCardSnapshot(snap, fresh, myCfg.url, Date.now());
+      if (merged) await saveServerCardSnapshot(merged);
+    });
+    return persistChain;
+  };
+  const statsDone = (async (): Promise<void> => {
+    const [stats, wishlistCount, videoStats] = await Promise.allSettled([
+      getServerStats(myCfg),
+      getWishlistCount(myCfg),
+      getVideoStats(myCfg),
+    ]);
+    if (stats.status === 'rejected') {
+      if (!painted) {
+        $('server-card').hidden = true;
+      } else if (snap) {
+        // The snapshot stays up, but it says so: without this the card
+        // would present days-old counts as if they were live.
+        $('server-last-update').textContent =
+          `couldn't refresh — showing saved data from ${relativeTime(snap.statsSavedAt)}`;
+      }
+      return;
+    }
+    if (wishlistCount.status === 'fulfilled') fresh.wishlistCount = wishlistCount.value;
+    if (videoStats.status === 'fulfilled') fresh.videoStats = videoStats.value;
+    fresh.stats = stats.value;
+    renderStats(
+      stats.value,
+      fresh.wishlistCount ?? snap?.wishlistCount ?? 0,
+      fresh.videoStats !== undefined ? fresh.videoStats : (snap?.videoStats ?? null),
+    );
+    if (snap && (wishlistCount.status === 'rejected' || videoStats.status === 'rejected')) {
+      // The counts just rendered include saved values; the line says so.
+      $('server-last-update').textContent += ' · some counts saved';
+    }
+    await persist();
+  })();
+  const albumsDone = (async (): Promise<void> => {
+    try {
+      fresh.albums = await getRecentlyAdded(myCfg, 12);
+      renderRail(myCfg, fresh.albums);
+      await persist();
+    } catch {
+      // Painted-but-null rail (never landed for this server) also gets the
+      // empty state, or its skeleton would shimmer for the whole open.
+      // The fallback is painted only — never persisted as data.
+      if (!painted || !snap?.albums) renderRail(myCfg, []);
+    }
+  })();
+  const videosDone = (async (): Promise<void> => {
+    try {
+      fresh.videos = await getRecentlyAddedVideos(myCfg, 12);
+      renderVideoRail(myCfg, fresh.videos);
+      await persist();
+    } catch {
+      if (!painted || !snap?.videos) renderVideoRail(myCfg, []);
+    }
+  })();
+  await Promise.allSettled([statsDone, albumsDone, videosDone]);
 }
 
 /* ── tabs ── */
@@ -1502,7 +1862,7 @@ async function mediaSearch(): Promise<void> {
     state.textContent = totalRows === 0 ? 'Nothing in your library matched.' : '';
   } catch (e) {
     if (reqId !== mediaReqId) return;
-    state.textContent = `Couldn’t reach your server — ${e instanceof Error ? e.message : String(e)}`;
+    state.textContent = `Couldn’t reach your server — ${connectionHint(cfg, e).message}`;
   }
 }
 
@@ -1622,6 +1982,9 @@ function init(): void {
   $('np-help-match').addEventListener('click', () => toggleMatchPanel());
   $('np-wrong-match').addEventListener('click', () => toggleMatchPanel(true));
   $('np-match-search').addEventListener('click', () => void guard(runMatchSearch));
+  $('np-exact-toggle').addEventListener('click', () => void guard(toggleExactForm));
+  $('np-exact-add').addEventListener('click', () => void guard(addExactCurrent));
+  $('np-exact-remove').addEventListener('click', () => void guard(removeExactCurrent));
   $('np-match-q').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
       e.preventDefault();
@@ -1753,7 +2116,7 @@ document.addEventListener('DOMContentLoaded', () => {
     void loadServerExtras();
     await guard(async () => {
       await loadNowPlaying();
-      await resolveNpServerState();
+      await Promise.all([resolveNpServerState(), resolveExactStatus()]);
       await Promise.all([loadRelease(), loadPendingSelection()]);
     });
     // The player remote reattaches to the background host's state and keeps

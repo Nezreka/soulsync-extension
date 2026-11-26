@@ -100,9 +100,11 @@ const TRACKS = {
 // /api/library/check-tracks: the server's batched ownership matcher.
 const OWNED = { drake: ["One Dance"] };
 let checkTracksCalls = 0;
+// This mock is an older server: no batch route (the SPA catch-all 405s a POST).
 globalThis.fetch = async (url, init) => {
   const u = new URL(url);
   const fail = () => ({ ok: false, status: 500, json: async () => ({}) });
+  if (u.pathname === "/api/v1/library/check") return { ok: false, status: 405, json: async () => { throw new Error("html"); } };
   if (u.pathname === "/api/v1/library/artists") {
     const q = u.searchParams.get("search") || "";
     if (q.toLowerCase().includes("boom")) return fail();

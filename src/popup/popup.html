@@ -61,6 +61,37 @@
               </div>
             </div>
           </div>
+          <div id="np-exact" class="np-exact" hidden>
+            <div id="np-exact-tags" class="tags"></div>
+            <div id="np-exact-staterow" class="np-exact-staterow" hidden>
+              <div id="np-exact-state" class="muted tiny"></div>
+              <button id="np-exact-remove" class="ghost" hidden>Remove</button>
+            </div>
+            <button id="np-exact-toggle" class="secondary block slim">Add exact SoundCloud upload</button>
+            <div id="np-exact-hint" class="muted tiny" hidden></div>
+            <div id="np-exact-form" hidden>
+              <label class="np-exact-field">
+                <span class="tiny muted">Title</span>
+                <input id="np-exact-title" />
+              </label>
+              <label class="np-exact-field">
+                <span class="tiny muted">Artist(s)</span>
+                <input id="np-exact-artists" placeholder="Comma-separated" />
+              </label>
+              <label class="np-exact-field">
+                <span class="tiny muted">Remixer (optional)</span>
+                <input id="np-exact-remixers" />
+              </label>
+              <div id="np-exact-uploader" class="muted tiny"></div>
+              <label class="np-exact-field">
+                <span class="tiny muted">Playlist</span>
+                <select id="np-exact-playlist">
+                  <option value="">No playlist</option>
+                </select>
+              </label>
+              <button id="np-exact-add" class="primary block slim">Add</button>
+            </div>
+          </div>
           <div id="np-match-panel" hidden>
             <div class="row">
               <input id="np-match-q" placeholder="Artist - Title" />
