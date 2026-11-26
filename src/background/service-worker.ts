@@ -9,7 +9,11 @@ import type { ReleaseSource } from '../shared/types.js';
 import {
   addExactSoundcloudTrack,
   addToWishlist,
+  checkVideo,
   checkWatchlist,
+  forgetArtistCheck,
+  rememberedWatchId,
+  watchStateFromCheck,
   deezerPlaylistTrackToMirror,
   getConfig,
   getDeezerPlaylistTracks,
@@ -351,10 +355,21 @@ async function handleBadgeAction(m: BadgeAction): Promise<Record<string, unknown
     }
     if (m.action === 'watch-artist') {
       await watchArtist(cfg, m.id, m.name, m.source);
+      forgetArtistCheck(cfg, m.name);
       return { ok: true };
     }
     if (m.action === 'unwatch-artist') {
-      await unwatchArtist(cfg, m.id);
+      // the batch check names the watchlist row it matched (it may be stored
+      // under another provider's id than the one the search resolves to):
+      // remove that row, and the resolved id too
+      const rowId = await rememberedWatchId(cfg, m.name);
+      if (rowId && rowId !== m.id) {
+        await unwatchArtist(cfg, rowId);
+        await unwatchArtist(cfg, m.id).catch(() => undefined);
+      } else {
+        await unwatchArtist(cfg, m.id);
+      }
+      forgetArtistCheck(cfg, m.name);
       return { ok: true };
     }
     if (m.action === 'check-watchlist') {
@@ -442,12 +457,15 @@ async function resolveVideoHit(
   kind: 'movie' | 'show',
   tmdbId?: number,
 ): Promise<VideoSearchHit | null> {
-  // TMDB id from the URL is exact — still resolve through search for the
-  // canonical title/year/poster the wishlist API wants.
-  const hits = await searchVideo(cfg, tmdbId ? String(tmdbId) : title);
+  // TMDB id from the URL is exact. The title search finds the canonical
+  // title/year/poster the wishlist API wants; when it doesn't list the id,
+  // the page's own title stands in (the id is what identifies it). The old
+  // search for the bare id ("603") never found the title it named.
+  const hits = await searchVideo(cfg, title);
   if (tmdbId) {
     const exact = hits.find((h) => h.tmdbId === tmdbId);
     if (exact) return exact;
+    return { tmdbId, title, kind, year, posterUrl: '' };
   }
   // Best text match: prefer same kind, then year proximity. Don't hard-filter
   // by kind — IMDb cards guess the kind and a wrong guess must not nuke results.
@@ -465,16 +483,52 @@ async function resolveVideoHit(
   return scored.length > 0 && scored[0].score > 0 ? scored[0].h : null;
 }
 
+/**
+ * A card's pill state from the batched video check, or null when the server
+ * has no batch route (the caller takes the per-title calls). Same states as
+ * the per-title path; an episode is on the wishlist only when that episode is.
+ */
+async function videoStateFromCheck(
+  cfg: ServerConfig,
+  kind: 'movie' | 'show',
+  tmdbId: number,
+  episode?: { season: number; episode: number },
+): Promise<Record<string, unknown> | null> {
+  const v = await checkVideo(cfg, { kind, tmdbId, episode });
+  if (v === 'unsupported') return null;
+  // For episodes, report 'movie' kind so the overlay renders the wishlist
+  // badge (not the watchlist eye).
+  const hitKind = episode ? 'movie' : kind;
+  if (v === null) return { state: 'unknown', onWatchlist: null, hitKind };
+  if (episode) {
+    const base = { onWatchlist: null, hitKind };
+    if (v.episodeInLibrary === true) return { state: 'in-library', ...base };
+    if (v.episodeInLibrary === null) return { state: 'unknown', ...base };
+    return { state: v.episodeOnWishlist === true ? 'on-wishlist' : 'addable', ...base };
+  }
+  const base = { onWatchlist: kind === 'show' ? v.following : null, hitKind };
+  if (v.inLibrary) return { state: 'in-library', ...base };
+  if (v.onWishlist) return { state: 'on-wishlist', ...base };
+  return { state: 'addable', ...base };
+}
+
 async function handleVideoBadgeAction(m: VideoBadgeAction): Promise<Record<string, unknown>> {
   const cfg = await getConfig();
   if (!cfg) return { error: 'No server configured — open the extension options first.' };
   try {
     if (m.action === 'check-video') {
+      // Episodes resolve as their show, then check the specific episode.
+      const kind = m.episode ? 'show' : m.kind;
+      // newer servers, TMDB id on the page: one batched check, no search
+      if (m.tmdbId && m.tmdbId > 0) {
+        const fast = await videoStateFromCheck(cfg, kind, m.tmdbId, m.episode);
+        if (fast) return fast;
+      }
       return throttledVideoCheck(async () => {
-        // Episodes resolve as their show, then check the specific episode.
-        const kind = m.episode ? 'show' : m.kind;
         const hit = await resolveVideoHit(cfg, m.title, m.year, kind, m.tmdbId);
         if (!hit) return { state: 'unknown', onWatchlist: null, hitKind: null };
+        const viaBatch = await videoStateFromCheck(cfg, hit.kind, hit.tmdbId, m.episode);
+        if (viaBatch) return viaBatch;
         // For episodes, report 'movie' kind so the overlay renders the wishlist
         // badge (not the watchlist eye).
         const hitKind = m.episode ? 'movie' : hit.kind;
@@ -617,6 +671,9 @@ browser.runtime.onMessage.addListener((message: unknown) => {
       const entries = await Promise.all(
         items.map(async (it) => {
           try {
+            // newer servers: one batched check, no metadata search per artist
+            const batched = await watchStateFromCheck(cfg, it.name, it.providerId);
+            if (batched !== undefined) return { watching: batched };
             let id = it.providerId ?? '';
             if (!id && it.name) {
               const best = await resolveArtistHit(cfg, it.name);

@@ -356,6 +356,9 @@ export async function addToWishlist(
   return wishlistTrack(cfg, best);
 }
 
+/** Tracks of one release resolved and wishlisted at the same time. */
+const RELEASE_CONCURRENCY = 4;
+
 export interface ReleaseWishlistResult {
   /** Tracks that landed on the wishlist (new or updated). */
   added: number;
@@ -377,14 +380,27 @@ export async function wishlistRelease(
     throw new Error("No tracklist found on this page — nothing to wishlist.");
   }
   const out: ReleaseWishlistResult = { added: 0, failed: [] };
-  for (const title of release.tracks) {
-    try {
-      await addToWishlist(cfg, { artist: release.artist, title, album: release.title });
-      out.added++;
-    } catch (e) {
-      out.failed.push({ title, error: e instanceof Error ? e.message : String(e) });
+  // a few tracks at a time: each one is a metadata search on the server
+  // (most of the wait), and one after another a 15-track album took as long
+  // as 15 searches. the transport still paces the requests
+  const errors: (string | null)[] = new Array(release.tracks.length).fill(null);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < release.tracks.length) {
+      const i = next++;
+      try {
+        await addToWishlist(cfg, { artist: release.artist, title: release.tracks[i], album: release.title });
+      } catch (e) {
+        errors[i] = e instanceof Error ? e.message : String(e);
+      }
     }
-  }
+  };
+  await Promise.all(Array.from({ length: Math.min(RELEASE_CONCURRENCY, release.tracks.length) }, worker));
+  release.tracks.forEach((title, i) => {
+    const error = errors[i];
+    if (error === null) out.added++;
+    else out.failed.push({ title, error });
+  });
   if (out.added === 0) {
     throw new Error(
       `None of the ${release.tracks.length} tracks could be wishlisted: ${out.failed[0]?.error ?? 'unknown error'}`,
@@ -861,6 +877,9 @@ export function clearBadgeCache(): void {
   badgeCache.clear();
   artistIdCache.clear();
   artistAlbumsCache.clear();
+  artistCheckCache.clear();
+  artistCheckSupport.clear();
+  pendingArtistChecks.clear();
 }
 
 function badgeKey(kind: string, name: string, artist?: string): string {
@@ -891,6 +910,214 @@ function memoized<T>(
   return p;
 }
 
+/* ── batched artist check (POST /api/v1/library/check, newer servers) ── */
+
+/** One artist as the batch check answers it. */
+export interface ArtistCheck {
+  inLibrary: boolean;
+  artistId: LibraryId | null;
+  /** Watched by this profile: by the page's provider id, the library
+   *  artist's provider ids, or the watched name. */
+  watching: boolean;
+  /** The id the matching watchlist row is stored under (for removal). */
+  watchId: string | null;
+  /** Present only when asked for. */
+  albums: { id: LibraryId; title: string }[] | null;
+}
+
+/** 'unsupported' = the server predates the batch route (use the old calls). */
+type ArtistCheckResult = ArtistCheck | null | 'unsupported';
+
+const CHECK_PATH = `${V1}/library/check`;
+/** How long artist checks gather before one request goes out. */
+const ARTIST_BATCH_MS = 40;
+/** The server answers at most 200 names per request. */
+const ARTIST_BATCH_MAX = 200;
+
+/** Per server URL: false once it answered the batch route with 404/405. */
+const artistCheckSupport = new Map<string, boolean>();
+
+interface PendingArtist {
+  name: string;
+  providerId: string;
+  albums: boolean;
+  waiters: Array<(v: ArtistCheckResult) => void>;
+}
+const pendingArtistChecks = new Map<string, { cfg: ServerConfig; items: Map<string, PendingArtist> }>();
+
+/** The name as the server echoes it back (trimmed, capped at 300). */
+const checkName = (name: string): string => name.trim().slice(0, 300);
+
+/** What one request asked for an artist: merged checks widen it. */
+interface ArtistAsk {
+  providerId: string;
+  albums: boolean;
+}
+
+function queueArtistCheck(
+  cfg: ServerConfig,
+  name: string,
+  providerId: string,
+  albums: boolean,
+): { p: Promise<ArtistCheckResult>; ask: ArtistAsk } {
+  if (artistCheckSupport.get(cfg.url) === false) {
+    return { p: Promise.resolve('unsupported'), ask: { providerId, albums } };
+  }
+  let ask: ArtistAsk = { providerId, albums };
+  const p = new Promise<ArtistCheckResult>((resolve) => {
+    let batch = pendingArtistChecks.get(cfg.url);
+    if (!batch) {
+      const fresh = { cfg, items: new Map<string, PendingArtist>() };
+      batch = fresh;
+      pendingArtistChecks.set(cfg.url, fresh);
+      setTimeout(() => {
+        if (pendingArtistChecks.get(cfg.url) === fresh) pendingArtistChecks.delete(cfg.url);
+        void flushArtistChecks(fresh.cfg, [...fresh.items.values()]);
+      }, ARTIST_BATCH_MS);
+    }
+    const key = normName(name);
+    const item = batch.items.get(key);
+    if (item) {
+      item.albums = item.albums || albums;
+      if (!item.providerId && providerId) item.providerId = providerId;
+      item.waiters.push(resolve);
+      ask = item;
+    } else {
+      const fresh: PendingArtist = { name: checkName(name), providerId, albums, waiters: [resolve] };
+      batch.items.set(key, fresh);
+      ask = fresh;
+    }
+  });
+  return { p, ask };
+}
+
+async function flushArtistChecks(cfg: ServerConfig, items: PendingArtist[]): Promise<void> {
+  for (let i = 0; i < items.length; i += ARTIST_BATCH_MAX) {
+    await sendArtistChecks(cfg, items.slice(i, i + ARTIST_BATCH_MAX));
+  }
+}
+
+async function sendArtistChecks(cfg: ServerConfig, items: PendingArtist[]): Promise<void> {
+  const settle = (it: PendingArtist, v: ArtistCheckResult): void => {
+    for (const w of it.waiters) w(v);
+  };
+  let rows: unknown[] | null = null;
+  try {
+    const { status, envelope } = await apiFetchWithStatus(cfg, CHECK_PATH, {
+      method: 'POST',
+      body: JSON.stringify({
+        artists: items.map((it) => ({
+          name: it.name,
+          ...(it.providerId ? { provider_id: it.providerId } : {}),
+          ...(it.albums ? { albums: true } : {}),
+        })),
+      }),
+    });
+    // An older server sends the unknown path to the SPA catch-all: a bare
+    // 404 (or 405 for a POST), or a 2xx page with no envelope.
+    if (isUnsupportedStatus(status) || isBare2xx(status, envelope)) {
+      artistCheckSupport.set(cfg.url, false);
+      for (const it of items) settle(it, 'unsupported');
+      return;
+    }
+    if (isOk(status, envelope) && Array.isArray(envelope.data?.artists)) {
+      artistCheckSupport.set(cfg.url, true);
+      rows = envelope.data.artists as unknown[];
+    }
+  } catch {
+    rows = null;
+  }
+  const byName = new Map<string, Record<string, unknown>>();
+  for (const r of rows ?? []) {
+    const o = (r ?? {}) as Record<string, unknown>;
+    if (typeof o.name === 'string') byName.set(o.name, o);
+  }
+  for (const it of items) {
+    const o = rows ? byName.get(it.name) : undefined;
+    if (!o || typeof o.in_library !== 'boolean') {
+      settle(it, null);
+      continue;
+    }
+    const albums = Array.isArray(o.albums)
+      ? (o.albums as unknown[]).flatMap((a) => {
+          const x = (a ?? {}) as { id?: unknown; title?: unknown };
+          const id = libraryId(x.id);
+          return id !== null && typeof x.title === 'string' ? [{ id, title: x.title }] : [];
+        })
+      : null;
+    const artistId = libraryId(o.artist_id);
+    settle(it, {
+      inLibrary: o.in_library && artistId !== null,
+      artistId,
+      watching: o.watching === true,
+      watchId: typeof o.watch_id === 'string' && o.watch_id ? o.watch_id : null,
+      albums,
+    });
+  }
+}
+
+/** Remembered batch answers, per server and artist. A provider id or an
+ *  album list asked for later than the remembered answer had asks again. */
+const artistCheckCache = new Map<string, { p: Promise<ArtistCheckResult>; at: number; ask: ArtistAsk }>();
+
+/**
+ * The batch check for one artist name, coalesced with every other check in
+ * the same few milliseconds into one request. null = couldn't verify,
+ * 'unsupported' = older server. Never throws.
+ */
+export function checkArtist(
+  cfg: ServerConfig,
+  name: string,
+  opts: { providerId?: string; albums?: boolean } = {},
+): Promise<ArtistCheckResult> {
+  const norm = normName(name);
+  if (!norm) return Promise.resolve(null);
+  const pid = opts.providerId ?? '';
+  const albums = opts.albums === true;
+  const key = `${cfg.url}|${norm}`;
+  const hit = artistCheckCache.get(key);
+  // the ask is the request's own (widened while it waits to go out)
+  if (hit && Date.now() - hit.at <= BADGE_CACHE_TTL_MS && (!pid || hit.ask.providerId === pid)
+    && (!albums || hit.ask.albums)) {
+    return hit.p;
+  }
+  const { p, ask } = queueArtistCheck(cfg, name, pid, albums);
+  const entry = { p, at: Date.now(), ask };
+  artistCheckCache.set(key, entry);
+  p.then((v) => {
+    if (v === null && artistCheckCache.get(key) === entry) artistCheckCache.delete(key);
+  });
+  return p;
+}
+
+/** Forget one artist's remembered check (after a watch or unwatch). */
+export function forgetArtistCheck(cfg: ServerConfig, name: string): void {
+  artistCheckCache.delete(`${cfg.url}|${normName(name)}`);
+}
+
+/** The watchlist row id the last batch check matched for this artist. */
+export async function rememberedWatchId(cfg: ServerConfig, name: string): Promise<string | null> {
+  const hit = artistCheckCache.get(`${cfg.url}|${normName(name)}`);
+  if (!hit) return null;
+  const v = await hit.p;
+  return v && v !== 'unsupported' && v.watching ? v.watchId : null;
+}
+
+/**
+ * Watch state through the batch check: true/false, null = couldn't verify,
+ * undefined = the server has no batch route (the caller takes the old path).
+ * No metadata search: the server matches ids and the watched name itself.
+ */
+export async function watchStateFromCheck(
+  cfg: ServerConfig,
+  name: string,
+  providerId?: string,
+): Promise<boolean | null | undefined> {
+  const v = await checkArtist(cfg, name, { providerId });
+  if (v === 'unsupported') return undefined;
+  return v === null ? null : v.watching;
+}
+
 const artistIdCache = new Map<string, { p: Promise<LibraryId | false | null>; at: number }>();
 
 /**
@@ -902,8 +1129,13 @@ function libraryArtistId(cfg: ServerConfig, name: string): Promise<LibraryId | f
   if (want.length === 0) return Promise.resolve(null);
   return memoized(
     artistIdCache,
-    want,
+    `${cfg.url}|${want}`,
     async () => {
+      const batched = await checkArtist(cfg, name);
+      if (batched !== 'unsupported') {
+        if (batched === null) return null;
+        return batched.inLibrary ? (batched.artistId ?? false) : false;
+      }
       try {
         const data = await apiFetch(
           cfg,
@@ -958,7 +1190,7 @@ function libraryArtistAlbums(
 ): Promise<{ id: LibraryId; title: string }[]> {
   return memoized(
     artistAlbumsCache,
-    artistId,
+    `${cfg.url}|${artistId}`,
     async () => {
       const data = await apiFetch(
         cfg,
@@ -978,20 +1210,80 @@ function libraryArtistAlbums(
   );
 }
 
+/** Edition words: a trailing "(…)", "[…]" or " - …" holding one of these
+ *  names a release of the same album ("Abbey Road (Remastered)",
+ *  "Rumours - Super Deluxe Edition"). "Fearless (Taylor's Version)" and
+ *  "(Live)" are other recordings and stay apart. */
+const EDITION_WORD =
+  /\b(edition|remaster(ed)?|deluxe|expanded|anniversary|reissue(d)?|bonus tracks?|mono|stereo|explicit|clean|collector'?s)\b/i;
+
+/** An album title with trailing edition qualifiers taken off, normalized. */
+export function baseAlbumTitle(title: string): string {
+  let t = title.trim();
+  for (;;) {
+    const paren = t.match(/^(.*\S)\s*[(\[]([^()\[\]]+)[)\]]$/);
+    if (paren && EDITION_WORD.test(paren[2])) {
+      t = paren[1].trim();
+      continue;
+    }
+    const dash = t.match(/^(.*\S)\s+[-–—]\s+([^-–—]+)$/);
+    if (dash && EDITION_WORD.test(dash[2])) {
+      t = dash[1].trim();
+      continue;
+    }
+    return normName(t);
+  }
+}
+
 /**
- * The library album id for an exact title under a library artist id.
- * null = no exact match — never throws for "absent", throws on transport
+ * The library album for a title among one artist's albums: the exact title
+ * first, else the same album on another edition ("Abbey Road" vs "Abbey
+ * Road (Remastered)", both ways). null = no match.
+ */
+export function pickLibraryAlbum(
+  albums: { id: LibraryId; title: string }[],
+  title: string,
+): LibraryId | null {
+  const want = normName(title);
+  if (!want) return null;
+  const exact = albums.find((a) => normName(a.title) === want);
+  if (exact) return exact.id;
+  const base = baseAlbumTitle(title);
+  if (!base) return null;
+  return albums.find((a) => baseAlbumTitle(a.title) === base)?.id ?? null;
+}
+
+/**
+ * One artist's albums: from the batch check when the server has it (the
+ * same request that resolves the artist), else the per-artist route.
+ * Throws when it couldn't verify, so callers keep the tri-state.
+ */
+async function artistAlbumsFor(
+  cfg: ServerConfig,
+  artistId: LibraryId,
+  artistName?: string,
+): Promise<{ id: LibraryId; title: string }[]> {
+  if (artistName) {
+    const v = await checkArtist(cfg, artistName, { albums: true });
+    if (v === null) throw new Error('library check failed');
+    if (v !== 'unsupported' && v.albums && v.artistId === artistId) return v.albums;
+  }
+  return libraryArtistAlbums(cfg, artistId);
+}
+
+/**
+ * The library album id for a title under a library artist id.
+ * null = no match — never throws for "absent", throws on transport
  * errors so callers keep the tri-state.
  */
 async function libraryAlbumId(
   cfg: ServerConfig,
   artistId: LibraryId,
   title: string,
+  artistName?: string,
 ): Promise<LibraryId | null> {
-  const wantTitle = normName(title);
-  if (wantTitle.length === 0) return null;
-  const albums = await libraryArtistAlbums(cfg, artistId);
-  return albums.find((a) => normName(a.title) === wantTitle)?.id ?? null;
+  if (normName(title).length === 0) return null;
+  return pickLibraryAlbum(await artistAlbumsFor(cfg, artistId, artistName), title);
 }
 
 /**
@@ -1011,14 +1303,20 @@ async function libraryHasAlbum(
   const wantTitle = normName(title);
   if (wantTitle.length === 0 || normName(artist ?? '').length === 0) return null;
   try {
-    const artistId = await libraryArtistId(cfg, artist as string);
+    // newer servers: the artist and their albums in the one batched request
+    const batched = await checkArtist(cfg, artist as string, { albums: true });
+    if (batched === null) return null;
+    const artistId =
+      batched === 'unsupported'
+        ? await libraryArtistId(cfg, artist as string)
+        : batched.inLibrary ? (batched.artistId ?? false) : false;
     if (artistId === null) return null; // server error — unknown, not absent
     if (artistId === false) {
       // Artist isn't in the library, so their album can't be either.
       cacheSet(key, false);
       return false;
     }
-    const found = (await libraryAlbumId(cfg, artistId, title)) !== null;
+    const found = (await libraryAlbumId(cfg, artistId, title, artist)) !== null;
     cacheSet(key, found);
     return found;
   } catch {
@@ -1121,7 +1419,7 @@ export async function resolveLibraryLink(
     } else if (kind === 'album' && artist && normName(artist).length > 0) {
       const artistId = await libraryArtistId(cfg, artist);
       if (artistId) {
-        const albumId = await libraryAlbumId(cfg, artistId, name);
+        const albumId = await libraryAlbumId(cfg, artistId, name, artist);
         const base = artistPage(artistId);
         return albumId !== null
           ? { url: base + albumParam(albumId), exact: true }
@@ -1185,12 +1483,14 @@ export async function lookupBadgeStatuses(
 
 /**
  * Is "artist - title" in the library? First the server's batched ownership
- * check (one request per artist, not rate-limited). Its "not owned" is
- * trusted for a single-artist credit; a multi-artist credit ("A & B") may
- * not be filed under that exact string, so it — like an older server
- * without the batch route — falls back to the per-track path: resolve
- * through the server's own track search, then the exact provider-ID lookup
- * and the strict title+artist library search. Tri-state: true = in library,
+ * check (one request per artist, not rate-limited). A multi-artist credit
+ * ("A & B") is asked as written and as each artist on its own (the library
+ * usually files it under the first), all in the same per-artist batches;
+ * any "owned" answers. "Not owned" is trusted for a single-artist credit;
+ * a multi-artist credit no one owns, like an older server without the
+ * batch route, falls back to the per-track path: resolve through the
+ * server's own track search, then the exact provider-ID lookup and the
+ * strict title+artist library search. Tri-state: true = in library,
  * false = verified absent, null = couldn't check.
  */
 async function libraryHasTrack(
@@ -1202,10 +1502,16 @@ async function libraryHasTrack(
   const cached = cacheGet(key);
   if (cached !== undefined) return cached;
   if (normName(title).length === 0 || normName(artist).length === 0) return null;
-  const owned = await checkTrackOwned(cfg, artist, title);
-  if (owned === true || (owned === false && splitArtists(artist).length <= 1)) {
-    cacheSet(key, owned);
-    return owned;
+  const split = splitArtists(artist);
+  const credits = split.length > 1 ? [artist, ...split] : [artist];
+  const verdicts = await Promise.all(credits.map((a) => checkTrackOwned(cfg, a, title)));
+  if (verdicts.includes(true)) {
+    cacheSet(key, true);
+    return true;
+  }
+  if (credits.length === 1 && verdicts[0] === false) {
+    cacheSet(key, false);
+    return false;
   }
   try {
     const { tracks: hits, source } = await searchTracks(cfg, `${artist} - ${title}`, 5);
@@ -1419,8 +1725,29 @@ export interface VideoStats {
   wishlist: number;
 }
 
-/** Video library counts via pagination totals (limit=1 = cheap). */
+/** Video counts in one call (GET /api/v1/video/stats, SoulSync 3.6+); older
+ *  servers fall back to three list totals. Episodes are the ones on disk. */
 export async function getVideoStats(cfg: ServerConfig): Promise<VideoStats> {
+  try {
+    const { status, envelope } = await apiFetchWithStatus(cfg, `${V1}/video/stats`, { method: 'GET' });
+    if (isOk(status, envelope)) {
+      const lib = (envelope.data?.library ?? {}) as Record<string, unknown>;
+      const wl = (envelope.data?.wishlist ?? {}) as Record<string, unknown>;
+      const n = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+      const movies = n(lib.movies);
+      const shows = n(lib.shows);
+      if (movies !== null && shows !== null) {
+        return { movies, shows, episodes: n(lib.episodes) ?? 0, wishlist: n(wl.total) ?? 0 };
+      }
+    }
+  } catch {
+    /* the per-list totals below */
+  }
+  return getVideoStatsByLists(cfg);
+}
+
+/** Video library counts via pagination totals (limit=1 = cheap). */
+async function getVideoStatsByLists(cfg: ServerConfig): Promise<VideoStats> {
   const count = async (kind: string): Promise<{ total: number; episodes: number }> => {
     try {
       // Video library nests pagination inside data (unlike wishlist which
@@ -1758,6 +2085,126 @@ export async function videoInLibrary(
   } catch {
     return null;
   }
+}
+
+/* ── batched video status (POST /api/v1/video/check, newer servers) ── */
+
+export interface VideoCheck {
+  inLibrary: boolean;
+  onWishlist: boolean;
+  /** show watchlist (follows plus airing library shows); null for a movie */
+  following: boolean | null;
+  /** only when an episode was asked */
+  episodeInLibrary: boolean | null;
+  episodeOnWishlist: boolean | null;
+}
+type VideoCheckResult = VideoCheck | null | 'unsupported';
+
+interface VideoAsk {
+  kind: 'movie' | 'show';
+  tmdbId: number;
+  episode?: { season: number; episode: number };
+}
+
+const VIDEO_CHECK_PATH = `${V1}/video/check`;
+const VIDEO_BATCH_MS = 40;
+const VIDEO_BATCH_MAX = 300;
+const videoCheckSupport = new Map<string, boolean>();
+const pendingVideoChecks = new Map<string, { cfg: ServerConfig; items: Map<string, { ask: VideoAsk; waiters: Array<(v: VideoCheckResult) => void> }> }>();
+
+const videoAskKey = (a: VideoAsk): string =>
+  `${a.kind}:${a.tmdbId}${a.episode ? `:${a.episode.season}x${a.episode.episode}` : ''}`;
+
+/**
+ * Library, wishlist and watchlist state of one movie/show (or episode) by
+ * TMDB id, coalesced with every other card's check in the same few
+ * milliseconds into one request. null = couldn't verify, 'unsupported' =
+ * older server (the caller takes the per-title calls). Never throws.
+ */
+export function checkVideo(cfg: ServerConfig, ask: VideoAsk): Promise<VideoCheckResult> {
+  if (!(ask.tmdbId > 0)) return Promise.resolve(null);
+  if (videoCheckSupport.get(cfg.url) === false) return Promise.resolve('unsupported');
+  return new Promise((resolve) => {
+    let batch = pendingVideoChecks.get(cfg.url);
+    if (!batch) {
+      const fresh = { cfg, items: new Map<string, { ask: VideoAsk; waiters: Array<(v: VideoCheckResult) => void> }>() };
+      batch = fresh;
+      pendingVideoChecks.set(cfg.url, fresh);
+      setTimeout(() => {
+        if (pendingVideoChecks.get(cfg.url) === fresh) pendingVideoChecks.delete(cfg.url);
+        const all = [...fresh.items.values()];
+        void (async () => {
+          for (let i = 0; i < all.length; i += VIDEO_BATCH_MAX) {
+            await sendVideoChecks(fresh.cfg, all.slice(i, i + VIDEO_BATCH_MAX));
+          }
+        })();
+      }, VIDEO_BATCH_MS);
+    }
+    const key = videoAskKey(ask);
+    const item = batch.items.get(key);
+    if (item) item.waiters.push(resolve);
+    else batch.items.set(key, { ask, waiters: [resolve] });
+  });
+}
+
+async function sendVideoChecks(
+  cfg: ServerConfig,
+  items: { ask: VideoAsk; waiters: Array<(v: VideoCheckResult) => void> }[],
+): Promise<void> {
+  const settle = (it: (typeof items)[number], v: VideoCheckResult): void => {
+    for (const w of it.waiters) w(v);
+  };
+  let rows: unknown[] | null = null;
+  try {
+    const { status, envelope } = await apiFetchWithStatus(cfg, VIDEO_CHECK_PATH, {
+      method: 'POST',
+      body: JSON.stringify({
+        items: items.map(({ ask }) => ({
+          kind: ask.kind,
+          tmdb_id: ask.tmdbId,
+          ...(ask.episode ? { season: ask.episode.season, episode: ask.episode.episode } : {}),
+        })),
+      }),
+    });
+    if (isUnsupportedStatus(status) || isBare2xx(status, envelope)) {
+      videoCheckSupport.set(cfg.url, false);
+      for (const it of items) settle(it, 'unsupported');
+      return;
+    }
+    if (isOk(status, envelope) && Array.isArray(envelope.data?.items)) {
+      videoCheckSupport.set(cfg.url, true);
+      rows = envelope.data.items as unknown[];
+    }
+  } catch {
+    rows = null;
+  }
+  // rows come back in the order asked (every ask sent is a valid item);
+  // each row is still checked against its ask before it is believed
+  const ordered = (rows ?? []).map((r) => (r ?? {}) as Record<string, unknown>);
+  const bool = (v: unknown): boolean | null => (typeof v === 'boolean' ? v : null);
+  items.forEach((it, i) => {
+    const o = rows ? ordered[i] : undefined;
+    if (!o || o.kind !== it.ask.kind || o.tmdb_id !== it.ask.tmdbId || typeof o.in_library !== 'boolean') {
+      settle(it, null);
+      return;
+    }
+    settle(it, {
+      inLibrary: o.in_library,
+      onWishlist: o.on_wishlist === true,
+      following: bool(o.following),
+      episodeInLibrary: bool(o.episode_in_library),
+      episodeOnWishlist: bool(o.episode_on_wishlist),
+    });
+  });
+}
+
+/** Forget whether servers have the batch routes (tests). */
+export function resetBatchSupport(): void {
+  videoCheckSupport.clear();
+  pendingVideoChecks.clear();
+  artistCheckSupport.clear();
+  pendingArtistChecks.clear();
+  artistCheckCache.clear();
 }
 
 /** Is a specific episode in the library? Uses the episode-level endpoint. */
