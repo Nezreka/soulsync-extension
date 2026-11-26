@@ -2,14 +2,15 @@
  * Transport for every call to the user's SoulSync server.
  *
  * Two server facts shape this:
- * - The public v1 API is rate-limited to 60 requests/minute per client IP
- *   (api/__init__.py `limiter.limit("60 per minute")(bp)`, flask-limiter
- *   fixed window, no Retry-After header). A page full of badges easily
- *   bursts past that, and every 429 used to surface as an "unknown" pill.
- *   v1 calls therefore go through a sliding-window pacer that stays under
- *   the limit, and a 429 that still slips through (the popup and the
- *   background each pace on their own) is retried after a backoff instead
- *   of failing.
+ * - The public v1 API is rate-limited (api/__init__.py, flask-limiter fixed
+ *   window, no Retry-After header). Since SoulSync 3.6.2 (#1923) a request
+ *   with a valid API key gets its own bucket of 600/minute; older servers
+ *   allow 60/minute per client IP. v1 calls go through a sliding-window
+ *   pacer sized for the keyed bucket (the popup and the background each
+ *   pace on their own, so each takes well under half). The first 429 means
+ *   an older server: the pacer drops to the old 45/minute for the rest of
+ *   this context's life, and the 429 itself is retried after a backoff
+ *   instead of failing.
  * - A server that accepts the connection but never answers would leave
  *   pills and popup cards spinning forever, so every request gets a timeout.
  *
@@ -17,9 +18,14 @@
  * rate-limited server-side and skip the pacer.
  */
 
-/** Requests this context lets itself make per window. Under the server's
- *  60 so the popup and the background together rarely collide. */
-let V1_BUDGET = 45;
+/** Requests this context lets itself make per window: under half the keyed
+ *  bucket (600/minute), so the popup and the background together stay under. */
+const FAST_BUDGET = 250;
+/** The budget after a 429 (a server older than the keyed bucket: 60/minute
+ *  per address, so the popup and the background together rarely collide). */
+const LEGACY_BUDGET = 45;
+let V1_BUDGET = FAST_BUDGET;
+let legacyBudget = LEGACY_BUDGET;
 let V1_WINDOW_MS = 60_000;
 const DEFAULT_TIMEOUT_MS = 20_000;
 /** Backoff before each 429 retry. flask-limiter's fixed window resets on
@@ -98,18 +104,28 @@ export async function serverFetch(
       if (timer !== undefined) clearTimeout(timer);
     }
     if (res.status !== 429 || attempt >= RETRY_BACKOFF_MS.length) return res;
-    // Rate-limited anyway: hold every queued v1 caller, not just this one.
+    // Rate-limited anyway: hold every queued v1 caller, not just this one,
+    // and pace for the old per-address limit from here on.
     const wait = RETRY_BACKOFF_MS[attempt];
-    if (v1) cooldownUntil = Math.max(cooldownUntil, Date.now() + wait);
+    if (v1) {
+      V1_BUDGET = Math.min(V1_BUDGET, legacyBudget);
+      cooldownUntil = Math.max(cooldownUntil, Date.now() + wait);
+    }
     else await sleep(wait);
   }
 }
 
+/** The budget the pacer is using now (tests, diagnostics). */
+export function currentV1Budget(): number {
+  return V1_BUDGET;
+}
+
 /** Test hook: forget pacing state, optionally with tighter limits. */
 export function resetServerFetchState(
-  limits: { budget?: number; windowMs?: number; backoffMs?: number[] } = {},
+  limits: { budget?: number; legacyBudget?: number; windowMs?: number; backoffMs?: number[] } = {},
 ): void {
-  V1_BUDGET = limits.budget ?? 45;
+  V1_BUDGET = limits.budget ?? FAST_BUDGET;
+  legacyBudget = limits.legacyBudget ?? LEGACY_BUDGET;
   V1_WINDOW_MS = limits.windowMs ?? 60_000;
   RETRY_BACKOFF_MS = limits.backoffMs ?? [3_000, 10_000, 30_000];
   sent.length = 0;

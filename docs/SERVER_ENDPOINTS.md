@@ -245,17 +245,34 @@ Update SoulSync to use this."
   `<hash>::soulsync`. The client keeps them as strings (`LibraryId` in
   `shared/player-api.ts`) and never parses them. Video and mirrored-playlist
   ids are still integers.
-- **v1 is rate-limited to 60 requests/minute per IP** (`api/__init__.py`,
-  flask-limiter fixed window, no `Retry-After`). `shared/http.ts` paces v1
-  calls to 45/minute per extension context and retries a 429 after a backoff;
-  every server request also has a timeout.
+- **v1 rate limit:** a request with a valid API key gets its own bucket of
+  600/minute (SoulSync 3.6.2+, #1923); older servers allow 60/minute per IP
+  (`api/__init__.py`, flask-limiter fixed window, no `Retry-After`).
+  `shared/http.ts` paces v1 calls to 250/minute per extension context; the
+  first 429 means an older server and drops the pacer to 45/minute. A 429 is
+  retried after a backoff; every server request also has a timeout.
+- **Batched badge checks (newer servers):** `POST /api/v1/library/check`
+  `{artists: [{name, provider_id?, albums?}]}` answers a page of artist names
+  in one request: `in_library`, `artist_id`, `albums` when asked, and
+  `watching`/`watch_id` (by the page's id, the library artist's ids, or the
+  watched name: no metadata search). `POST /api/v1/video/check`
+  `{items: [{kind, tmdb_id, season?, episode?}]}` does the same for movies
+  and shows by TMDB id (`in_library`, `on_wishlist`, `following`,
+  `episode_in_library`, `episode_on_wishlist`). The background coalesces
+  every check made within 40 ms into one request. 404/405 (or a 2xx without
+  an envelope) = an older server: remembered per server, and the per-artist
+  calls below take over.
 - **Track badges batch through `POST /api/library/check-tracks`**
   `{artist_name, tracks: [{name}]}` → `{success, owned_tracks: {name: {owned,
   track_id, file_path, …}}}`: the web UI's own ownership matcher, one request
   per artist, non-v1 so not rate-limited. A missing route (older server) falls
   back to search → `GET /api/v1/library/lookup` → `GET /api/v1/library/tracks`.
-- **Album badges use `GET /api/v1/library/artists/<id>/albums`**, once per
-  artist, matched locally.
+- **Album badges** match locally among the artist's albums (from the batch
+  check, or `GET /api/v1/library/artists/<id>/albums` once per artist on an
+  older server): the exact title first, then the same album on another
+  edition ("Abbey Road (Remastered)" = "Abbey Road").
+- **Track badges for a multi-artist credit** ask check-tracks for the credit
+  as written and for each artist on its own; any "owned" answers.
 - **Read-only API keys** (`scope: "read"`) pass every GET under `/api/v1/` but
   get `403 INSUFFICIENT_SCOPE` on every POST and every non-v1 route
   (`api/auth.py::enforce_read_key_scope`). Test connection probes
